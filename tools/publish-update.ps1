@@ -33,6 +33,11 @@ if ($LASTEXITCODE -ne 0) { throw "GitHub CLI is not logged in. Run:  gh auth log
 $keyFile = Join-Path $env:USERPROFILE ".imperio\signing.key"
 if ($Key) {
   $key = $Key.Trim()
+  if (-not (Test-Path $keyFile)) {
+    # Remember it so the plain double-click never has to ask.
+    New-Item -ItemType Directory -Force (Split-Path $keyFile) | Out-Null
+    [IO.File]::WriteAllText($keyFile, $key)
+  }
 } elseif (Test-Path $keyFile) {
   $key = (Get-Content $keyFile -Raw).Trim()
 } else {
