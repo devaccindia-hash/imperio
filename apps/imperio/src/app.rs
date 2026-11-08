@@ -116,6 +116,8 @@ pub struct ImperioApp {
     just_updated: bool,
     /// When the pointer started resting on a guarded widget (see `dwell_ok`).
     hover_since: std::collections::HashMap<&'static str, Instant>,
+    /// Install button armed by a first click until this instant (two-click install).
+    confirm_until: Option<Instant>,
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -174,6 +176,7 @@ impl ImperioApp {
             auto_check: Arc::new(AtomicBool::new(cfg.check_updates)),
             just_updated: std::env::args().any(|a| a == "--updated"),
             hover_since: Default::default(),
+            confirm_until: None,
             cfg,
         };
         app.start_engine();
@@ -660,20 +663,27 @@ impl ImperioApp {
                                 if ghost_button(ui, "Later").clicked() {
                                     *self.update.lock().unwrap() = UpdateState::Dismissed(a.clone());
                                 }
-                                let install = egui::Button::new(
-                                    RichText::new("Download and install").size(13.5).strong().color(Color32::WHITE),
-                                )
-                                .fill(accent())
-                                .corner_radius(CornerRadius::same(8))
-                                .min_size(Vec2::new(0.0, 32.0));
-                                // `hovered()` guards against a phantom click
-                                // reported on the button's first frame.
+                                // Two deliberate clicks: the first arms the button
+                                // for a few seconds, the second installs. A single
+                                // stray press can never start an update.
+                                let armed = self.confirm_until.map_or(false, |t| t > Instant::now());
+                                let label = if armed { "Click again to confirm" } else { "Download and install" };
+                                let install = egui::Button::new(RichText::new(label).size(13.5).strong().color(Color32::WHITE))
+                                    .fill(if armed { accent_hover() } else { accent() })
+                                    .corner_radius(CornerRadius::same(8))
+                                    .min_size(Vec2::new(0.0, 32.0));
                                 let r = ui.add(install);
                                 let rested = self.dwell_ok("install_banner", r.hovered());
-                                if r.clicked() && rested {
+                                if r.clicked() && rested && armed {
+                                    self.confirm_until = None;
                                     self.install_update(a.clone(), "banner");
+                                } else if r.clicked() && rested {
+                                    self.confirm_until = Some(Instant::now() + Duration::from_secs(6));
                                 } else if r.clicked() {
                                     tracing::warn!("ignored install click: pointer had not rested on the button");
+                                }
+                                if armed {
+                                    ui.ctx().request_repaint_after(Duration::from_millis(500));
                                 }
                             });
                         });
@@ -947,13 +957,21 @@ impl ImperioApp {
                 self.check_updates();
             }
             if let UpdateState::Available(a) | UpdateState::Dismissed(a) = &upd {
-                let install = egui::Button::new(RichText::new(format!("Install {}", a.version)).size(13.0).strong().color(Color32::WHITE))
-                    .fill(accent())
+                let armed = self.confirm_until.map_or(false, |t| t > Instant::now());
+                let label = if armed { "Click again to confirm".to_string() } else { format!("Install {}", a.version) };
+                let install = egui::Button::new(RichText::new(label).size(13.0).strong().color(Color32::WHITE))
+                    .fill(if armed { accent_hover() } else { accent() })
                     .corner_radius(CornerRadius::same(8));
                 let r = ui.add(install);
                 let rested = self.dwell_ok("install_settings", r.hovered());
-                if r.clicked() && rested {
+                if r.clicked() && rested && armed {
+                    self.confirm_until = None;
                     self.install_update(a.clone(), "settings");
+                } else if r.clicked() && rested {
+                    self.confirm_until = Some(Instant::now() + Duration::from_secs(6));
+                }
+                if armed {
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
                 }
             }
         });
