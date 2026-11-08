@@ -1,7 +1,7 @@
 {
-  "version": "0.3.9",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.9/Imperio.exe",
-  "sha256": "187a79d9bff01b0375c6b958ba7bf69dc47dde7bccaebd81609340e6542e39fe",
-  "notes": "Downloads and updates now come from GitHub.",
-  "sig": "wAjf4RK37qC35vvlaMsdKK3OiE8PId56VHI0bgQOLkaZRWAJb8yPuggpiqdwgEYOg0yjd1DF2Rd40CTl6yrWCA"
+  "version": "0.3.10",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.10/Imperio.exe",
+  "sha256": "eb7485e8424f57b4c52cfc59f1fc66151a71931bf224c3350ed85011ea15d661",
+  "notes": "Updates now need two clicks to confirm, so nothing installs by accident.",
+  "sig": "sPa_K16SD9ntsM0zPSBQgdI-QJHCKuvEFPrUiuuTliGs34Q4KdqY_qQKWNjBtGkWj1oPvAWldQZN7u5JdGSBCA"
 }
