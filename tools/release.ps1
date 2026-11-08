@@ -65,14 +65,18 @@ Write-Host "signed latest.json: version $($signed.version), sha256 $($signed.sha
 # --- GitHub Release with the exe attached -------------------------------------
 if (-not $SkipRelease) {
   $tag = "v$version"
-  $exists = & cmd /c "gh release view $tag --repo $Repo >nul 2>&1 && echo yes"
-  if ($exists -match "yes") {
+  $asset = Join-Path $dist "Imperio.exe"
+  $notesArg = if ($Notes) { $Notes } else { "Imperio $version" }
+  # gh writes progress to stderr; run it as a process so Windows PowerShell
+  # does not treat that as an error, and check the exit code ourselves.
+  $probe = Start-Process -FilePath "gh" -ArgumentList @("release", "view", $tag, "--repo", $Repo) -Wait -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\imperio-gh-view.txt" -RedirectStandardError "$env:TEMP\imperio-gh-view.err"
+  if ($probe.ExitCode -eq 0) {
     Write-Host "Release $tag exists; replacing its Imperio.exe"
-    & cmd /c "gh release upload $tag `"$dist\Imperio.exe`" --clobber --repo $Repo 2>&1"
+    $args = @("release", "upload", $tag, "`"$asset`"", "--clobber", "--repo", $Repo)
   } else {
-    $notesArg = if ($Notes) { $Notes } else { "Imperio $version" }
-    & cmd /c "gh release create $tag `"$dist\Imperio.exe`" --repo $Repo --title `"Imperio $version`" --notes `"$notesArg`" 2>&1"
+    $args = @("release", "create", $tag, "`"$asset`"", "--repo", $Repo, "--title", "`"Imperio $version`"", "--notes", "`"$notesArg`"")
   }
-  if ($LASTEXITCODE -ne 0) { Write-Error "GitHub release failed (is `gh auth login` done?)" }
+  $gh = Start-Process -FilePath "gh" -ArgumentList $args -Wait -NoNewWindow -PassThru
+  if ($gh.ExitCode -ne 0) { Write-Error "GitHub release failed (exit $($gh.ExitCode)); is 'gh auth login' done?" }
   Write-Host "Release asset: $url" -ForegroundColor Green
 }
