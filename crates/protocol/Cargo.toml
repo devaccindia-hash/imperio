@@ -1,0 +1,11 @@
+[package]
+name = "imperio-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+postcard = { version = "1", features = ["alloc"] }

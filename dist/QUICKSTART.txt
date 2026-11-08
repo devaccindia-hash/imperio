@@ -1,0 +1,114 @@
+IMPERIO - two-PC test (early build)
+===================================
+
+These binaries are self-contained (no install, no Visual C++ redistributable
+needed). This is a pre-release build: no installer, no code signing yet.
+Windows SmartScreen / antivirus may warn about an unknown unsigned program -
+that is expected at this stage.
+
+Copy this WHOLE folder to BOTH PCs.
+
+********************  THE EASY WAY: Imperio.exe on both PCs  **************
+
+  Double-click  Imperio.exe  on BOTH computers. One window, like AnyDesk:
+
+    Left  "This computer"    - this PC's Device ID, its Access Code and the
+                               address to type on the other PC. Sharing is
+                               on as soon as the window opens.
+    Right "Connect to..."    - type the OTHER PC's address (the 100.x
+                               Tailscale one, or 192.168.x) and its code,
+                               click Connect. The remote screen opens in its
+                               own window (F11 = full screen).
+
+  First time on the PC you want to control: click "Allow through firewall..."
+  at the bottom and accept the admin prompt (opens UDP 7700).
+
+  Switches on the left: pause sharing, ask before each session (a Yes/No
+  dialog appears when someone connects), open mode for your own Tailscale
+  devices (no code needed; other networks refused).
+
+  Saved computers: anything you connect to appears as a tile for one-click
+  reconnects (right-click a tile to remove it).
+
+  Sharing settings tab: pause sharing, ask before someone connects, record
+  sessions (MP4 in Videos\Imperio - also Session > Start recording in the
+  remote-screen window), your plan (Free / Pro licence key), and updates
+  (checked at start; "Download and install" replaces the exe and restarts).
+  Advanced (folded): Tailscale open mode, firewall helper, trust a changed
+  identity.
+
+  Closing the window keeps sharing on; Imperio stays in the tray (bottom
+  right). Quit from the tray menu.
+
+  Command line still works:  Imperio.exe host [...]  /  Imperio.exe view ...
+  The older 1-START-HOST.bat / 2-START-VIEWER.bat launchers still work too.
+***************************************************************************
+
+------------------------------------------------------------------------
+CASE A: both PCs on the SAME network (same Wi-Fi / router) - EASIEST
+------------------------------------------------------------------------
+
+ON THE HOST PC (the one to control):
+  1. Right-click  allow-firewall.bat  ->  Run as administrator  (one time).
+  2. Open a terminal (PowerShell) in this folder and run:
+         .\imperio-host.exe
+     It prints something like:
+         Device ID : 123 456 789
+         Code      : 42 42 42            <-- you'll type this on the viewer
+         Direct mode: viewers connect to this machine's IP, udp/7700
+     Leave it running. Note the Code.
+  3. Find this PC's network IP (run in the same terminal):
+         ipconfig | findstr IPv4
+     Use the 192.168.x.x or 10.x.x.x address.
+     (On the PC this build came from it was 192.168.1.17 - yours may differ.)
+
+ON THE VIEWER PC (the one you use):
+  4. Open a terminal in this folder and run (replace IP and code):
+         .\imperio-viewer.exe 192.168.1.17 --code 424242
+     A window opens showing the host's screen. Move the mouse / type - it
+     drives the host. Close the window to end.
+
+  Tips:
+    - View only (don't send mouse/keyboard):  add  --no-input
+    - If the host has 2+ monitors, switch with  Ctrl+Shift+1 , Ctrl+Shift+2 ...
+    - The window title shows fps / round-trip time / latency.
+
+------------------------------------------------------------------------
+CASE B: the two PCs are on DIFFERENT networks (over the internet)
+------------------------------------------------------------------------
+This needs the little rendezvous server (imperio-signal.exe) running somewhere
+BOTH PCs can reach - e.g. on the host's network with UDP 7800 port-forwarded
+on the router, or on a cheap VPS. Then:
+
+  On the server machine:   .\imperio-signal.exe
+  On the host PC:          .\imperio-host.exe --server SERVER_IP:7800
+  On the viewer PC:        .\imperio-viewer.exe --id 123456789 --server SERVER_IP:7800 --code 424242
+                           (--id is the host's Device ID; spaces optional)
+
+If a direct path can't be punched through the NATs it falls back to relaying
+through the server automatically. Start with Case A first.
+
+------------------------------------------------------------------------
+UNATTENDED ACCESS (connect without someone reading you a code)
+------------------------------------------------------------------------
+  On the host, set a permanent password:
+         .\imperio-host.exe --password mysecret
+  Then the viewer uses  --code mysecret  (it's the password).
+  Optional extra security: a TOTP 2nd factor and an "approve each connection"
+  prompt can be enabled in C:\ProgramData\Imperio\config.toml.
+
+The first time a viewer connects it records the host's identity key. If you
+later see "HOST IDENTITY CHANGED" it means a different machine answered for
+that Device ID - stop and check, or pass --trust-new if you expected it.
+
+------------------------------------------------------------------------
+WHAT TO WATCH / REPORT BACK
+------------------------------------------------------------------------
+  - Did the viewer window show the host's screen? Smooth?
+  - Did mouse + keyboard work? Any wrong keys (special chars, shortcuts)?
+  - Latency: the viewer title shows "rtt" (network round-trip) and "present"
+    (capture->display) in ms. Lower is better.
+  - Try a UAC prompt on the host (right-click something -> Run as admin): does
+    the viewer see it and can you click it? (This only works fully once the
+    service is installed as admin - not required for a first test.)
+  - Any crashes, freezes, or error lines in either terminal.

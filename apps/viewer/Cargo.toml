@@ -1,0 +1,22 @@
+[package]
+name = "imperio-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+imperio-audio = { path = "../../crates/audio" }
+imperio-clipboard = { path = "../../crates/clipboard" }
+imperio-codec = { path = "../../crates/codec" }
+imperio-protocol = { path = "../../crates/protocol" }
+imperio-transport = { path = "../../crates/transport" }
+imperio-ui = { path = "../../crates/ui" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+rand.workspace = true
+base64.workspace = true
+windows.workspace = true
+winit.workspace = true
+raw-window-handle.workspace = true

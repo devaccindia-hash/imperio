@@ -1,0 +1,34 @@
+[package]
+name = "imperio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Imperio remote desktop: one app for sharing your screen and connecting to others"
+
+[[bin]]
+name = "imperio"
+path = "src/main.rs"
+
+[dependencies]
+imperio-host = { path = "../host" }
+imperio-viewer = { path = "../viewer" }
+imperio-protocol = { path = "../../crates/protocol" }
+imperio-ui = { path = "../../crates/ui" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+raw-window-handle.workspace = true
+serde.workspace = true
+serde_json = "1"
+sha2.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+ureq = "3"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.37"
+windows = { workspace = true, features = [
+    "Win32_Graphics_Dwm",
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+] }

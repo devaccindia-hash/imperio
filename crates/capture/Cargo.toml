@@ -1,0 +1,13 @@
+[package]
+name = "imperio-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+imperio-protocol = { path = "../protocol" }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+windows.workspace = true
+windows-capture = "2.0"

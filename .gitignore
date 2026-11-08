@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+*.log
+/bench-results/
+.env
+
+# built binaries (published as GitHub Release assets instead)
+dist/*.exe
+site/downloads/
+# secrets
+*.key
+*signing key*

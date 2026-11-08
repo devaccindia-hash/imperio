@@ -1,0 +1,16 @@
+[package]
+name = "imperio-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+imperio-capture = { path = "../../crates/capture" }
+imperio-codec = { path = "../../crates/codec" }
+imperio-protocol = { path = "../../crates/protocol" }
+imperio-transport = { path = "../../crates/transport" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows.workspace = true

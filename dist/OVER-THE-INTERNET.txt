@@ -1,0 +1,35 @@
+USING IMPERIO ACROSS DIFFERENT NETWORKS  (free, no server to pay for)
+=====================================================================
+
+The one-click bats work when both PCs are on the SAME Wi-Fi/router.
+To connect two PCs on DIFFERENT networks (home <-> office, you <-> a
+relative), the easiest free way is a free mesh VPN that puts both PCs on
+one private network. Then Imperio works exactly like on the same Wi-Fi.
+
+Recommended: TAILSCALE (free for personal use, 2 minutes to set up).
+
+STEP 1 - install Tailscale on BOTH PCs
+  - Go to  https://tailscale.com/download  , install, and sign in with the
+    SAME account (Google/Microsoft/email) on both PCs.
+  - That's it - both PCs are now on one private network.
+
+STEP 2 - run Imperio as usual
+  - On the HOST PC: run  1-START-HOST.bat
+    It now shows a line like:
+        Address : 100.101.102.103:7700   (VPN / Tailscale - works from other networks)
+    Use THAT address (the 100.x one), not the 192.168.x one.
+  - On the VIEWER PC: run  2-START-VIEWER.bat
+    Enter that 100.x address and the Code. Done - works from anywhere.
+
+Notes
+  - If the host does NOT show a 100.x line, Tailscale isn't running on it -
+    open the Tailscale app and make sure it's connected, then re-run the host.
+  - You can also find a PC's Tailscale address by opening the Tailscale app,
+    or running:  tailscale ip -4
+  - ZeroTier is a free alternative to Tailscale and works the same way.
+
+Why not "just connect over the internet" directly?
+  Both PCs sit behind home routers that hide their real address, so they
+  can't find each other without help. A paid option is to run the included
+  imperio-signal.exe on a cheap VPS or a port-forwarded router - but the VPN
+  above is free and simpler, so start there.
