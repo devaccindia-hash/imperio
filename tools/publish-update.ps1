@@ -13,12 +13,12 @@ param(
   [string]$Version = "",
   [string]$Notes = "",
   [string]$Key = "",
-  [string]$Repo = "devaccindia-hash/imperio",
+  [string]$GitHubRepo = "devaccindia-hash/imperio",
   [string]$PagesUrl = "https://devaccindia-hash.github.io/imperio",
   [switch]$NoPush
 )
 $ErrorActionPreference = "Stop"
-$repo = Split-Path -Parent $PSScriptRoot
+$repoDir = Split-Path -Parent $PSScriptRoot
 $env:Path = "C:\Program Files\GitHub CLI;$env:USERPROFILE\.cargo\bin;" + $env:Path
 
 Write-Host ""
@@ -46,7 +46,7 @@ if ($Key) {
 $env:IMPERIO_SIGNING_KEY = $key
 
 # --- version ------------------------------------------------------------------
-$cargo = Join-Path $repo "Cargo.toml"
+$cargo = Join-Path $repoDir "Cargo.toml"
 $current = (Select-String -Path $cargo -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 $parts = $current.Split('.')
 $suggest = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
@@ -67,10 +67,10 @@ $text = $re.Replace($text, "version = `"$Version`"", 1)
 Write-Host "  Version set to $Version" -ForegroundColor Green
 
 # --- build, sign, GitHub Release ------------------------------------------------
-& (Join-Path $repo "tools\release.ps1") -Notes $Notes -Repo $Repo
+& (Join-Path $repoDir "tools\release.ps1") -Notes $Notes -GitHubRepo $GitHubRepo
 
 # --- commit + push (GitHub Pages redeploys site/ including latest.json) ---------
-Push-Location $repo
+Push-Location $repoDir
 & cmd /c "git add Cargo.toml Cargo.lock site/latest.json 2>&1" | Out-Null
 & cmd /c "git commit -q -m `"Release $Version`" -m `"$Notes`" 2>&1" | Out-Null
 if (-not $NoPush) {
@@ -94,9 +94,9 @@ if (-not $NoPush) {
   if ($live -and $live.version -eq $Version) {
     Write-Host ""
     Write-Host "  Published Imperio $Version." -ForegroundColor Green
-    Write-Host "  Download: https://github.com/$Repo/releases/latest/download/Imperio.exe"
+    Write-Host "  Download: https://github.com/$GitHubRepo/releases/latest/download/Imperio.exe"
     Write-Host "  Users see the update on their next start (or within a few hours in the tray)."
   } else {
-    Write-Warning "GitHub Pages has not served $Version yet. Check the 'Deploy website' run at https://github.com/$Repo/actions"
+    Write-Warning "GitHub Pages has not served $Version yet. Check the 'Deploy website' run at https://github.com/$GitHubRepo/actions"
   }
 }
