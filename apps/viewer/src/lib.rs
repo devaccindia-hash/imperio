@@ -18,7 +18,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::keyboard::KeyCode;
 
 use std::net::{ToSocketAddrs, UdpSocket};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -36,7 +37,7 @@ use imperio_transport::identity;
 use imperio_transport::jitter::FrameAssembler;
 use imperio_transport::lan::{self, CompleteFrame};
 use imperio_transport::link::{Incoming, SecureLink};
-use imperio_transport::now_us;
+use imperio_transport::{clip, now_us};
 use imperio_transport::rendezvous::{self, Path};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -473,8 +474,34 @@ impl ApplicationHandler<Net> for App {
     }
 }
 
+/// Why the session ended, when it was not the user closing the window. Set by
+/// the network thread, reported by [`run_session`] as its error.
+type EndReason = Arc<Mutex<Option<String>>>;
+
+/// No authenticated datagram for this long means the other side is gone.
+const LINK_LOST_AFTER: Duration = Duration::from_secs(10);
+
+/// What the network thread needs to know about this session.
+struct RxOptions {
+    trust_new: bool,
+    /// The Device ID the user asked for (ID mode); the host must present it.
+    expect_id: Option<u32>,
+    /// Second-factor code to send along with Hello, if the user gave one.
+    totp: Option<String>,
+    end_reason: EndReason,
+}
+
 /// Network thread: receive, NACK/report housekeeping, frame assembly, RTT.
-fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy<Net>, trust_new: bool) {
+fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy<Net>, opts: RxOptions) {
+    let RxOptions { trust_new, expect_id, totp, end_reason } = opts;
+    // End the session with an explanation the user will see.
+    let fail = move |proxy: &EventLoopProxy<Net>, why: String| {
+        tracing::error!(reason = %why, "session ended");
+        if let Ok(mut r) = end_reason.lock() {
+            r.get_or_insert(why);
+        }
+        let _ = proxy.send_event(Net::Bye);
+    };
     std::thread::Builder::new()
         .name("net-rx".into())
         .spawn(move || {
@@ -498,12 +525,23 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
             let mut last_ping = Instant::now() - Duration::from_secs(1);
             let mut last_key_req = Instant::now() - Duration::from_secs(1);
             let mut last_stats = Instant::now();
+            let mut clip_in = clip::Reassembler::default();
+            // Liveness and start-up: Hello is repeated until the host answers
+            // (control datagrams are not retransmitted by the link).
+            let started = Instant::now();
+            let mut last_heard = Instant::now();
+            let mut last_hello = Instant::now();
+            let mut stream_started = false;
             loop {
                 let now = Instant::now();
                 match socket.recv_from(&mut buf) {
                     Ok((n, from)) => {
                         if from == link.peer() {
-                            match link.handle_datagram(&buf[..n], now) {
+                            let incoming = link.handle_datagram(&buf[..n], now);
+                            if incoming.is_some() {
+                                last_heard = now;
+                            }
+                            match incoming {
                                 Some(Incoming::Media { payload, .. }) => {
                                     if let Some((h, p)) = lan::parse(payload) {
                                         assembler.push(h, p, now);
@@ -517,6 +555,7 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                                         monitor,
                                         monitors,
                                     } => {
+                                        stream_started = true;
                                         let _ = proxy.send_event(Net::StreamInfo {
                                             width,
                                             height,
@@ -528,6 +567,17 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                                     ControlMessage::Clipboard(text) => {
                                         let _ = proxy.send_event(Net::Clipboard(text));
                                     }
+                                    ControlMessage::ClipboardChunk { id, index, count, data } => {
+                                        if let Some(text) = clip_in.push(id, index, count, data) {
+                                            let _ = proxy.send_event(Net::Clipboard(text));
+                                        }
+                                    }
+                                    ControlMessage::Denied(reason) => {
+                                        // Shown to the user; keep it to one sane line.
+                                        let reason: String = reason.chars().filter(|c| !c.is_control()).take(300).collect();
+                                        fail(&proxy, reason);
+                                        return;
+                                    }
                                     ControlMessage::Identity { device_id, public, sig } => {
                                         let sig_ok = sig.len() == 64
                                             && public.len() == 32
@@ -537,8 +587,17 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                                                 sig.as_slice().try_into().unwrap(),
                                             );
                                         if !sig_ok {
-                                            tracing::error!("host identity signature invalid; disconnecting");
-                                            let _ = proxy.send_event(Net::Bye);
+                                            fail(&proxy, "The other computer could not prove its identity, so the session was closed.".into());
+                                            return;
+                                        }
+                                        if expect_id.is_some_and(|want| want != device_id) {
+                                            fail(
+                                                &proxy,
+                                                format!(
+                                                    "A different computer answered (ID {}) than the one you asked for. The session was closed.",
+                                                    imperio_protocol::device_id::format(device_id)
+                                                ),
+                                            );
                                             return;
                                         }
                                         let fp = identity::fingerprint(public.as_slice().try_into().unwrap());
@@ -547,7 +606,13 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                                             known_hosts::Trust::Known => tracing::info!(device_id, fingerprint = %fp, "host identity verified"),
                                             known_hosts::Trust::Mismatch => {
                                                 tracing::error!(device_id, fingerprint = %fp, "HOST IDENTITY CHANGED — possible impersonation. Disconnecting. Re-run with --trust-new only if you expected this.");
-                                                let _ = proxy.send_event(Net::Bye);
+                                                fail(
+                                                    &proxy,
+                                                    "This is not the same computer you connected to before under this ID (its identity key changed). \
+                                                     If it was reinstalled or replaced, tick \u{201c}accept a changed identity\u{201d} under Sharing settings \u{203a} Advanced and connect again. \
+                                                     Otherwise, do not connect."
+                                                        .into(),
+                                                );
                                                 return;
                                             }
                                         }
@@ -591,6 +656,20 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                     }
                     Err(_) => {}
                 }
+                if now.duration_since(last_heard) > LINK_LOST_AFTER {
+                    fail(&proxy, "The connection to the other computer was lost.".into());
+                    return;
+                }
+                if !stream_started
+                    && now.duration_since(started) < Duration::from_secs(6)
+                    && now.duration_since(last_hello) >= Duration::from_millis(500)
+                {
+                    let _ = link.send_control(&ControlMessage::Hello { version: PROTOCOL_VERSION });
+                    if let Some(code) = &totp {
+                        let _ = link.send_control(&ControlMessage::Totp(code.clone()));
+                    }
+                    last_hello = now;
+                }
                 link.tick(now);
                 let (frames, need_key) = assembler.poll(now);
                 for f in frames {
@@ -628,11 +707,36 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
         .expect("rx thread");
 }
 
-/// Resolve a path to the host and complete the SPAKE2 handshake.
-fn connect(
-    args: &Args,
-    socket: &UdpSocket,
-) -> anyhow::Result<(Path, imperio_transport::crypto::SessionKeys)> {
+/// After SPAKE2 both sides hold *a* key, but only the same key if the code
+/// matched. Prove it before opening a window: ping until one datagram from
+/// the host opens under our key. A wrong code never produces one.
+fn confirm_keys(socket: &UdpSocket, link: &SecureLink) -> anyhow::Result<bool> {
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut last_ping = Instant::now() - Duration::from_secs(1);
+    let mut buf = vec![0u8; 2048];
+    while Instant::now() < deadline {
+        if last_ping.elapsed() >= Duration::from_millis(300) {
+            let _ = link.send_control(&ControlMessage::Ping { t_us: now_us() });
+            last_ping = Instant::now();
+        }
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) if from == link.peer() => {
+                if link.handle_datagram(&buf[..n], Instant::now()).is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(_) => {}
+            Err(e) if rendezvous::is_transient_recv_error(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
+}
+
+/// Resolve a path to the host, complete the SPAKE2 handshake and confirm the
+/// keys match. Returns the encrypted link, ready to use.
+fn connect(args: &Args, socket: &Arc<UdpSocket>) -> anyhow::Result<(Path, Arc<SecureLink>)> {
     // No --code given: assume the host is in open mode (no code). If the host
     // actually requires a code, authentication will simply fail.
     let code = args.code.clone().unwrap_or_else(|| OPEN_CODE.to_string());
@@ -679,7 +783,18 @@ fn connect(
                 if let Ok(msg) = HandshakeMsg::decode(&body) {
                     if msg.session == session {
                         let keys = ours.finish(&msg.spake_msg, false)?;
-                        return Ok((path, keys));
+                        let link = Arc::new(SecureLink::new(socket.clone(), path.addr(), keys));
+                        if confirm_keys(socket, &link)? {
+                            return Ok((path, link));
+                        }
+                        if args.code.is_some() {
+                            anyhow::bail!(
+                                "That code was not accepted. Check the code shown on the other computer right now (it changes after each session) and try again."
+                            );
+                        }
+                        anyhow::bail!(
+                            "That computer asks for a code. Type the code shown on its Imperio window, then connect again."
+                        );
                     }
                 }
             }
@@ -707,6 +822,8 @@ fn diagnose(host: std::net::SocketAddr) -> String {
         o[0] == 100 && (64..=127).contains(&o[1]) // Tailscale / CGNAT
     };
     let same_subnet = match (my_ip, host.ip()) {
+        // This very computer: the network is not the problem.
+        (_, h) if h.is_loopback() => true,
         (Some(IpAddr::V4(me)), IpAddr::V4(h)) => {
             // Two VPN addresses (Tailscale) count as "same network" even
             // though their octets differ; otherwise compare the /24.
@@ -718,25 +835,19 @@ fn diagnose(host: std::net::SocketAddr) -> String {
         _ => true, // can't tell; don't blame the network
     };
 
-    let mut msg = String::from("Could not reach the host.\n");
-    match my_ip {
-        Some(ip) => msg.push_str(&format!("  This PC: {ip}    Host you entered: {}\n", host.ip())),
-        None => msg.push_str(&format!("  Host you entered: {}\n", host.ip())),
-    }
+    let mut msg = match my_ip {
+        Some(ip) => format!("Could not reach {} (this computer is {ip}). ", host.ip()),
+        None => format!("Could not reach {}. ", host.ip()),
+    };
     if !same_subnet {
         msg.push_str(
-            "  >> The two PCs are on DIFFERENT networks (the first three numbers\n\
-             \x20    of the addresses don't match). Connect BOTH PCs to the same\n\
-             \x20    Wi-Fi or router and try again. (Guest Wi-Fi often blocks this.)\n",
+            "The two computers are on different networks (the first three numbers of the addresses differ). \
+             Put both on the same Wi-Fi or router, or use the Tailscale address on both. Guest Wi-Fi often blocks this.\n",
         );
     } else {
         msg.push_str(
-            "  >> Same network, but the host isn't answering. On the HOST PC:\n\
-             \x20    1. Make sure its window is open and shows 'Address' and 'Code'.\n\
-             \x20    2. Re-run 1-START-HOST.bat and click YES on the admin prompt\n\
-             \x20       (that opens the firewall), OR allow imperio-host.exe in your\n\
-             \x20       antivirus. Then try the viewer again.\n\
-             \x20    3. Double-check you typed the exact Address and Code shown.\n",
+            "The other computer is not answering. On that computer: make sure Imperio is open and sharing is on, \
+             click Sharing settings \u{203a} Advanced \u{203a} \u{201c}Allow through firewall\u{201d}, and check the address you typed matches the one it shows.\n",
         );
     }
     msg
@@ -842,15 +953,25 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
         None => args.direct = Some(target),
     }
     let socket = Arc::new(imperio_transport::bind_udp("0.0.0.0:0")?);
-    let (path, keys) = connect(&args, &socket)?;
+    let (path, link) = connect(&args, &socket)?;
     tracing::info!(peer = %path.addr(), relay = matches!(path, Path::Relay(_)), "handshake complete; link encrypted");
     if let Some(f) = &req.on_connected {
         f();
     }
-    let link = Arc::new(SecureLink::new(socket.clone(), path.addr(), keys));
 
+    let end_reason: EndReason = Arc::new(Mutex::new(None));
     let event_loop = EventLoop::<Net>::with_user_event().with_any_thread(true).build()?;
-    spawn_rx(socket.clone(), link.clone(), event_loop.create_proxy(), args.trust_new);
+    spawn_rx(
+        socket.clone(),
+        link.clone(),
+        event_loop.create_proxy(),
+        RxOptions {
+            trust_new: args.trust_new,
+            expect_id: args.id,
+            totp: args.totp.clone(),
+            end_reason: end_reason.clone(),
+        },
+    );
     // Menu clicks on the session window arrive as winit user events.
     let menu_proxy = event_loop.create_proxy();
     ui::set_command_sink(move |cmd| {
@@ -860,8 +981,9 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
     // Clipboard: viewer -> host on local change (only when input is enabled).
     let clipboard = if args.send_input {
         let link = link.clone();
+        let next_id = AtomicU32::new(1);
         Some(Arc::new(ClipboardSync::spawn(MAX_CLIPBOARD_BYTES, move |text| {
-            let _ = link.send_control(&ControlMessage::Clipboard(text));
+            clip::send(&link, next_id.fetch_add(1, Ordering::Relaxed), text);
         })))
     } else {
         None
@@ -890,5 +1012,10 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
         recorder: None,
     };
     event_loop.run_app(&mut app)?;
+    app.stop_recording(false);
+    // Ended by the network side (refused, identity problem, link lost)?
+    if let Some(why) = end_reason.lock().ok().and_then(|mut r| r.take()) {
+        anyhow::bail!("{why}");
+    }
     Ok(())
 }

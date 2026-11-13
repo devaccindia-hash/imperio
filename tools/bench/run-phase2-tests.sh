@@ -6,6 +6,11 @@ R=./target/release
 S=../imperio-cloud/signal/target/release
 OUT=bench-results
 mkdir -p "$OUT"
+# Throwaway profile: never touch the real %ProgramData%\Imperio config.
+PROFILE="$(pwd)/$OUT/phase2-profile"
+mkdir -p "$PROFILE/data" "$PROFILE/appdata"
+export IMPERIO_DATA_DIR="$(cygpath -w "$PROFILE/data")"
+export APPDATA="$(cygpath -w "$PROFILE/appdata")"
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g' "$1" | grep -vE '^\s*$'; }
 killall_imperio() { for p in imperio-viewer imperio-host imperio-signal imperio-bench; do taskkill //IM $p.exe //F >/dev/null 2>&1; done; sleep 1; }
 CODE=123456
@@ -15,8 +20,7 @@ killall_imperio
 echo "##### 1. input probe through the encrypted session (host idle) #####"
 ($R/imperio-host.exe --port 7700 --code $CODE > $OUT/p2-1-host.log 2>&1 &)
 sleep 3
-ID=$(grep -m1 '^device_id' "/c/ProgramData/Imperio/config.toml" 2>/dev/null | grep -oE '[0-9]+')
-[ -z "$ID" ] && ID=$(cat "$APPDATA/imperio/device_id" 2>/dev/null)
+ID=$(grep -m1 '^device_id' "$PROFILE/data/config.toml" 2>/dev/null | grep -oE '[0-9]+')
 $R/imperio-bench.exe probe-input 127.0.0.1:7700 $CODE
 sleep 1
 killall_imperio

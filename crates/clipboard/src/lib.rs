@@ -5,6 +5,7 @@
 //! the owner can send it over the link. `apply_remote` sets the local
 //! clipboard and records the text so the poller does not echo it back.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,8 +15,17 @@ struct Shared {
     max_bytes: usize,
 }
 
+/// Dropping the handle stops the watcher thread (within one poll interval),
+/// so a finished session no longer reads the clipboard or sends it anywhere.
 pub struct ClipboardSync {
     shared: Arc<Mutex<Shared>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for ClipboardSync {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl ClipboardSync {
@@ -23,6 +33,8 @@ impl ClipboardSync {
     pub fn spawn(max_bytes: usize, on_change: impl Fn(String) + Send + 'static) -> Self {
         let shared = Arc::new(Mutex::new(Shared { last: None, max_bytes }));
         let poll = shared.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         std::thread::Builder::new()
             .name("clipboard".into())
             .spawn(move || {
@@ -39,6 +51,9 @@ impl ClipboardSync {
                 }
                 loop {
                     std::thread::sleep(Duration::from_millis(300));
+                    if stopped.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let Ok(text) = cb.get_text() else { continue };
                     let mut s = poll.lock().unwrap();
                     if text.len() > s.max_bytes || s.last.as_deref() == Some(text.as_str()) {
@@ -50,7 +65,7 @@ impl ClipboardSync {
                 }
             })
             .expect("clipboard thread");
-        Self { shared }
+        Self { shared, stop }
     }
 
     /// Apply text received from the peer to the local clipboard.

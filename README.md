@@ -60,12 +60,27 @@ tokens, relay forwarding restricted to the session's two addresses, per-IP
 Connect rate limiting, and abuse reports; brute-force backoff and a consent /
 scam-awareness notice on every incoming session. See `docs/test-report.md`.
 
-Not yet: audio (WASAPI + Opus), a GUI, installer + code signing, accounts and
-non-enumerable IDs, TCP/443 relay, and a low-latency encoder path on
-discrete-GPU-primary displays (see the encoder-latency note in the test
-report).
+Since then: one `Imperio.exe` with a home window (share this computer /
+connect to another, saved computers, tray icon), host audio, MP4 session
+recording, signed self-updates, offline Pro licence keys, server-assigned
+device IDs bound to the device key, and a CPU bridge to the integrated GPU's
+low-latency encoder on discrete-GPU-primary displays.
+
+Hardening pass (0.3.12): nothing a peer sends acts on the host until the
+second factor and the consent prompt have passed; a wrong code, a refusal or
+a lost connection is reported to the person connecting instead of leaving an
+empty window; clipboard texts of any size up to 256 KB sync; held keys are
+released when a session ends; the stream recovers when the desktop
+duplication is lost (elevation prompt, resolution change). See `SECURITY.md`
+for the threat model and the known limits.
+
+Not yet: Opus audio, an installer and code signing, accounts, a public
+relay, and a TCP/443 fallback.
 
 ## Running
+
+Most people just run `Imperio.exe` on both computers. The command-line
+programs below are the same engine without the home window.
 
 ```
 cargo build --release
@@ -104,8 +119,15 @@ cargo test
 target\release\imperio-bench.exe capture 5                        # Desktop Duplication stats
 target\release\imperio-bench.exe probe-input 127.0.0.1:7700 <code> # pairs and checks SendInput
 target\release\imperio-bench.exe lossy-proxy 7701 127.0.0.1:7700 5 # 5% loss proxy for NACK testing
-bash tools/bench/run-phase2-tests.sh                              # all scenarios, one machine
+bash tools/bench/run-e2e-tests.sh                                 # 21 end-to-end checks, one machine
+bash tools/bench/run-phase2-tests.sh                              # loss / relay / latency scenarios
 ```
+
+`run-e2e-tests.sh` covers pairing, wrong codes, identity pinning, TOTP, the
+authorization gate, and the signal server (direct, relay, ID binding). Both
+scripts run against a throwaway profile (`IMPERIO_DATA_DIR`), never your real
+configuration. Set `IMPERIO_DATA_DIR` yourself to keep Imperio's settings in a
+folder of your choice (a portable copy on a USB stick, for example).
 
 ## License
 

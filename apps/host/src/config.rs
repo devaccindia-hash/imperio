@@ -79,48 +79,104 @@ impl Default for Config {
 
 /// `%ProgramData%\Imperio` (machine-wide, readable by the SYSTEM service),
 /// falling back to `%APPDATA%\Imperio` when ProgramData is not writable.
+/// Probed once per process: the answer cannot change while we run, and the
+/// probe touches the disk.
 pub fn data_dir() -> PathBuf {
-    let candidates = [
-        std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("Imperio")),
-        std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Imperio")),
-        Some(std::env::temp_dir().join("Imperio")),
-    ];
-    for c in candidates.into_iter().flatten() {
-        if std::fs::create_dir_all(&c).is_ok() {
-            let probe = c.join(".write-test");
-            if std::fs::write(&probe, b"").is_ok() {
-                let _ = std::fs::remove_file(&probe);
-                return c;
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        // `IMPERIO_DATA_DIR` keeps everything in a folder of your choice: a
+        // portable copy on a USB stick, or a throwaway profile for tests.
+        if let Some(dir) = std::env::var_os("IMPERIO_DATA_DIR").map(PathBuf::from) {
+            if !dir.as_os_str().is_empty() && std::fs::create_dir_all(&dir).is_ok() {
+                return dir;
             }
         }
-    }
-    std::env::temp_dir()
+        let candidates = [
+            std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("Imperio")),
+            std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Imperio")),
+            Some(std::env::temp_dir().join("Imperio")),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if std::fs::create_dir_all(&c).is_ok() {
+                let probe = c.join(format!(".write-test-{}", std::process::id()));
+                if std::fs::write(&probe, b"").is_ok() {
+                    let _ = std::fs::remove_file(&probe);
+                    return c;
+                }
+            }
+        }
+        std::env::temp_dir()
+    })
+    .clone()
 }
 
 pub fn config_path() -> PathBuf {
     data_dir().join("config.toml")
 }
 
+/// Serialises config writes within the process (home window and host engine
+/// both save).
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Load the config, creating it with a fresh device id on first run.
+///
+/// The returned config always carries a device identity key: it is generated
+/// here, once, rather than lazily by whichever component needs it first.
+/// (Generating it later, on a copy, let a second copy of the config overwrite
+/// the file without the key, so the computer came back with a new identity
+/// after every restart and viewers were told it had been swapped.)
 pub fn load_or_create() -> Config {
     let path = config_path();
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        match toml::from_str::<Config>(&text) {
-            Ok(c) => return c,
+    let mut loaded = None;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str::<Config>(&text) {
+            Ok(c) => loaded = Some(c),
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "config unreadable; using defaults")
+                // Never silently replace a file that may hold the identity
+                // key, password and licence: keep it next to the new one.
+                let backup = path.with_extension("toml.unreadable");
+                let kept = std::fs::copy(&path, &backup).is_ok();
+                tracing::warn!(path = %path.display(), error = %e, kept_copy = kept, "config unreadable; starting from defaults")
             }
-        }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "config could not be read; using defaults"),
     }
-    let c = Config::default();
-    if let Err(e) = save(&c) {
-        tracing::warn!(error = %e, "could not write config");
+    let fresh = loaded.is_none();
+    let mut c = loaded.unwrap_or_default();
+    let has_identity = c
+        .identity_key
+        .as_deref()
+        .and_then(imperio_transport::identity::DeviceKey::from_seed_b64)
+        .is_some();
+    if !has_identity {
+        c.identity_key = Some(imperio_transport::identity::DeviceKey::generate().seed_b64());
+    }
+    if fresh || !has_identity {
+        if let Err(e) = save(&c) {
+            tracing::warn!(error = %e, "could not write config");
+        }
     }
     c
 }
 
+/// Write the config atomically: a crash or power cut mid-write must not leave
+/// a truncated file (which would cost the device identity).
 pub fn save(c: &Config) -> anyhow::Result<()> {
     let text = toml::to_string_pretty(c)?;
-    std::fs::write(config_path(), text)?;
+    let path = config_path();
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    // `rename` replaces the destination on Windows (MOVEFILE_REPLACE_EXISTING).
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }

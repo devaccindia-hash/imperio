@@ -16,7 +16,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -46,6 +47,17 @@ pub fn hinstance() -> HINSTANCE {
 pub fn init_dpi() {
     // SAFETY: plain API call; failure just means a manifest already decided.
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) };
+}
+
+/// Opt the process into per-monitor DPI awareness, so every coordinate the
+/// process sees (monitor rectangles, the virtual desktop, the cursor) is in
+/// real pixels. The host needs this before it measures anything: screen
+/// capture switches the process to real pixels anyway, and a rectangle read
+/// before that moment would be in scaled units and send the remote mouse to
+/// the wrong place on a display scaled above 100%. Harmless if already set.
+pub fn init_dpi_per_monitor() {
+    // SAFETY: plain API call; failure means awareness was already decided.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
 /// Scale factor from the 96-dpi design grid to the system DPI.

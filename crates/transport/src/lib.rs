@@ -18,6 +18,7 @@
 //! client can be added later.
 
 pub mod cc;
+pub mod clip;
 pub mod crypto;
 pub mod identity;
 pub mod jitter;

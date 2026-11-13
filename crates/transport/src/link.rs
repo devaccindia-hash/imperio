@@ -340,9 +340,10 @@ impl SecureLink {
                     return None;
                 }
                 let n = body.get_u16() as usize;
-                let seqs: Vec<u32> = (0..n)
-                    .filter_map(|_| (body.len() >= 4).then(|| body.get_u32()))
-                    .collect();
+                let mut seqs = Vec::with_capacity(n.min(body.len() / 4));
+                while seqs.len() < n && body.len() >= 4 {
+                    seqs.push(body.get_u32());
+                }
                 self.retransmit(&seqs);
                 None
             }

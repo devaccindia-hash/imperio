@@ -63,15 +63,54 @@ pub fn is_transient_recv_error(e: &std::io::Error) -> bool {
     )
 }
 
+/// Most LAN candidates accepted from (or sent to) the signal server.
+const MAX_LOCAL_CANDIDATES: usize = 4;
+
+/// A LAN candidate must actually be a LAN address. The list comes from the
+/// other peer by way of the server, so without this check anyone could make a
+/// host spray hole-punch probes at arbitrary internet addresses.
+fn is_lan_candidate(a: &SocketAddr) -> bool {
+    match a.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private() || v4.is_loopback() || v4.is_link_local()
+                // Carrier-grade NAT / Tailscale range, 100.64.0.0/10.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s0 = v6.segments()[0];
+            v6.is_loopback() || (s0 & 0xfe00) == 0xfc00 || (s0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// The addresses worth probing for a peer: its (few, genuinely local) LAN
+/// candidates plus the public address the server observed.
+fn punch_candidates(peer_public: SocketAddr, peer_locals: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut cands: Vec<SocketAddr> = peer_locals
+        .into_iter()
+        .filter(|a| a.port() != 0 && is_lan_candidate(a))
+        .take(MAX_LOCAL_CANDIDATES)
+        .collect();
+    if !cands.contains(&peer_public) {
+        cands.push(peer_public);
+    }
+    cands
+}
+
+/// Receive one signaling message. Only datagrams that come from `server` are
+/// accepted: anything else claiming to be signaling is a third party trying to
+/// steer this client (for example towards a host it controls).
 fn recv_signal(
     socket: &UdpSocket,
+    server: SocketAddr,
     timeout: Duration,
-) -> anyhow::Result<Option<(SignalMessage, SocketAddr)>> {
+) -> anyhow::Result<Option<SignalMessage>> {
     socket.set_read_timeout(Some(timeout))?;
     let mut buf = [0u8; 1500];
     match socket.recv_from(&mut buf) {
-        Ok((n, from)) if n > 1 && buf[0] == Kind::Signal as u8 => {
-            Ok(SignalMessage::decode(&buf[1..n]).ok().map(|m| (m, from)))
+        Ok((n, from)) if from == server && n > 1 && buf[0] == Kind::Signal as u8 => {
+            Ok(SignalMessage::decode(&buf[1..n]).ok())
         }
         Ok(_) => Ok(None),
         Err(e) if is_transient_recv_error(&e) => Ok(None),
@@ -80,14 +119,17 @@ fn recv_signal(
 }
 
 /// Host side: register until a viewer asks for us, then punch.
-/// Returns when a path to the viewer exists.
+/// Returns `Some` when a path to the viewer exists, or `None` as soon as
+/// `cancel` reports true (the user paused sharing, asked for a new code, or
+/// is quitting).
 pub fn host_wait_for_viewer(
     socket: &UdpSocket,
     server: SocketAddr,
     device_id: DeviceId,
     key: &DeviceKey,
     force_relay: bool,
-) -> anyhow::Result<(SessionId, Path)> {
+    cancel: &dyn Fn() -> bool,
+) -> anyhow::Result<Option<(SessionId, Path)>> {
     let locals = local_candidates(socket.local_addr()?.port());
     let public = key.public().to_vec();
     let sig = key
@@ -96,6 +138,9 @@ pub fn host_wait_for_viewer(
     let mut last_register = Instant::now() - Duration::from_secs(10);
     let mut registered = false;
     loop {
+        if cancel() {
+            return Ok(None);
+        }
         if last_register.elapsed() > Duration::from_secs(3) {
             socket.send_to(
                 &SignalMessage::Register {
@@ -109,27 +154,26 @@ pub fn host_wait_for_viewer(
             )?;
             last_register = Instant::now();
         }
-        match recv_signal(socket, Duration::from_millis(500))? {
-            Some((SignalMessage::Registered { public }, _)) => {
+        match recv_signal(socket, server, Duration::from_millis(500))? {
+            Some(SignalMessage::Registered { public }) => {
                 if !registered {
                     tracing::info!(%public, "registered with signal server");
                     registered = true;
                 }
             }
-            Some((
-                SignalMessage::Incoming {
-                    session,
-                    token,
-                    peer_public,
-                    peer_locals,
-                },
-                _,
-            )) => {
+            Some(SignalMessage::Rejected { reason }) => {
+                bail!("the signal server refused this device: {reason}")
+            }
+            Some(SignalMessage::Incoming {
+                session,
+                token,
+                peer_public,
+                peer_locals,
+            }) => {
                 tracing::info!(session, %peer_public, ?peer_locals, "incoming connection request");
-                let mut cands = peer_locals;
-                cands.push(peer_public);
+                let cands = punch_candidates(peer_public, peer_locals);
                 let path = punch(socket, server, session, token, &cands, force_relay)?;
-                return Ok((session, path));
+                return Ok(Some((session, path)));
             }
             _ => {}
         }
@@ -163,9 +207,9 @@ pub fn register_new(
         if Instant::now() > deadline {
             anyhow::bail!("signal server did not assign a device id in time");
         }
-        match recv_signal(socket, Duration::from_millis(500))? {
-            Some((SignalMessage::Assigned { device_id }, _)) => return Ok(device_id),
-            Some((SignalMessage::Rejected { reason }, _)) => {
+        match recv_signal(socket, server, Duration::from_millis(500))? {
+            Some(SignalMessage::Assigned { device_id }) => return Ok(device_id),
+            Some(SignalMessage::Rejected { reason }) => {
                 anyhow::bail!("registration rejected: {reason}")
             }
             _ => {}
@@ -180,7 +224,8 @@ pub fn viewer_connect(
     target: DeviceId,
     force_relay: bool,
 ) -> anyhow::Result<(SessionId, Path)> {
-    let locals = local_candidates(socket.local_addr()?.port());
+    let mut locals = local_candidates(socket.local_addr()?.port());
+    locals.truncate(MAX_LOCAL_CANDIDATES);
     for attempt in 0..3 {
         socket.send_to(
             &SignalMessage::Connect {
@@ -192,24 +237,25 @@ pub fn viewer_connect(
         )?;
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            match recv_signal(socket, Duration::from_millis(300))? {
-                Some((
-                    SignalMessage::PeerInfo {
-                        session,
-                        token,
-                        peer_public,
-                        peer_locals,
-                    },
-                    _,
-                )) => {
+            match recv_signal(socket, server, Duration::from_millis(300))? {
+                Some(SignalMessage::PeerInfo {
+                    session,
+                    token,
+                    peer_public,
+                    peer_locals,
+                }) => {
                     tracing::info!(session, %peer_public, ?peer_locals, "peer info received");
-                    let mut cands = peer_locals;
-                    cands.push(peer_public);
+                    let cands = punch_candidates(peer_public, peer_locals);
                     let path = punch(socket, server, session, token, &cands, force_relay)?;
                     return Ok((session, path));
                 }
-                Some((SignalMessage::NotFound { .. }, _)) => bail!("device {target} is not online"),
-                Some((SignalMessage::RateLimited, _)) => bail!("signal server rate-limited this client; try again shortly"),
+                Some(SignalMessage::NotFound { .. }) => bail!(
+                    "That computer is not online right now (ID {}). Ask them to open Imperio and check the ID.",
+                    imperio_protocol::device_id::format(target)
+                ),
+                Some(SignalMessage::RateLimited) => {
+                    bail!("Too many attempts in a short time. Wait a few seconds and try again.")
+                }
                 _ => {}
             }
         }
@@ -265,8 +311,8 @@ fn punch(
     // Relay (token-authorised).
     for _ in 0..5 {
         socket.send_to(&SignalMessage::RelayBind { session, token }.encode(), server)?;
-        if let Some((SignalMessage::RelayReady { session: s }, _)) =
-            recv_signal(socket, Duration::from_millis(600))?
+        if let Some(SignalMessage::RelayReady { session: s }) =
+            recv_signal(socket, server, Duration::from_millis(600))?
         {
             if s == session {
                 tracing::info!(%server, "relay path established");
@@ -344,4 +390,47 @@ pub fn recv_kind(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn punch_candidates_keep_only_real_lan_addresses() {
+        let public: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        let locals: Vec<SocketAddr> = [
+            "192.168.1.20:7700",
+            "8.8.8.8:53", // not a LAN address: would be a reflection target
+            "10.0.0.5:7700",
+            "100.100.1.2:7700", // Tailscale
+            "192.168.1.21:0",   // port 0 is never valid
+            "172.16.0.1:7700",
+            "192.168.1.22:7700", // over the cap
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let c = punch_candidates(public, locals);
+        assert_eq!(c.len(), MAX_LOCAL_CANDIDATES + 1);
+        assert!(c.contains(&public));
+        assert!(!c.iter().any(|a| a.ip().to_string() == "8.8.8.8"));
+        assert!(!c.iter().any(|a| a.port() == 0));
+    }
+
+    #[test]
+    fn signaling_from_a_stranger_is_ignored() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = client.local_addr().unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let msg = SignalMessage::RelayReady { session: 1 }.encode();
+        stranger.send_to(&msg, to).unwrap();
+        let got = recv_signal(&client, server_addr, Duration::from_millis(600)).unwrap();
+        assert!(got.is_none(), "a forged signal message must be dropped");
+        server.send_to(&msg, to).unwrap();
+        let got = recv_signal(&client, server_addr, Duration::from_millis(600)).unwrap();
+        assert_eq!(got, Some(SignalMessage::RelayReady { session: 1 }));
+    }
 }

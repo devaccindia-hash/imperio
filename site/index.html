@@ -3,369 +3,307 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Imperio — help someone with their computer without being there</title>
-<meta name="description" content="Imperio is a one-file remote desktop for Windows. Type the address shown on the other screen, press Connect, and you are there. Encrypted end to end, no install, free for personal use.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Imperio — remote desktop for Windows in one file</title>
+<meta name="description" content="Imperio is a one-file remote desktop for Windows 10 and 11. Open it on both computers, type the address and one-time code, and you are there. End-to-end encrypted, no install, no account, free for personal use.">
+<link rel="canonical" href="https://devaccindia-hash.github.io/imperio/">
+<meta name="theme-color" content="#0e0e10">
+<meta name="color-scheme" content="dark">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Imperio">
+<meta property="og:url" content="https://devaccindia-hash.github.io/imperio/">
 <meta property="og:title" content="Imperio — remote desktop that just connects">
-<meta property="og:description" content="One file. No install. Encrypted end to end. Free for personal use.">
-<meta name="theme-color" content="#121214">
+<meta property="og:description" content="One file. No install, no account. End-to-end encrypted. Free for personal use on Windows 10 and 11.">
+<meta property="og:image" content="https://devaccindia-hash.github.io/imperio/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Imperio — help someone with their computer without being there.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Imperio — remote desktop that just connects">
+<meta name="twitter:description" content="One file. No install, no account. End-to-end encrypted. Free for personal use on Windows 10 and 11.">
+<meta name="twitter:image" content="https://devaccindia-hash.github.io/imperio/og.png">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --bg:#121214; --bg2:#17171a; --ink:#f4f3f1; --ink-2:#b8b7b3; --ink-3:#7c7b78;
-    --line:rgba(255,255,255,.08); --line-2:rgba(255,255,255,.14);
-    --card:rgba(255,255,255,.035); --card-2:rgba(255,255,255,.06);
-    --red:#e8453c; --red-2:#ff6b5e; --amber:#f2b544; --green:#3ddc84;
-    --radius:18px; --max:1120px;
-    --serif:"Instrument Serif",Georgia,"Times New Roman",serif;
-    --sans:"Inter",ui-sans-serif,system-ui,"Segoe UI",sans-serif;
-    --mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
-  }
-  *{box-sizing:border-box}
-  html{scroll-behavior:smooth}
-  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased;overflow-x:hidden}
-  a{color:inherit;text-decoration:none}
-  ::selection{background:rgba(232,69,60,.35)}
-
-  /* ----- backdrop: grid + glows ----- */
-  .bgfx{position:fixed;inset:0;z-index:-1;pointer-events:none;
-    background:
-      radial-gradient(900px 500px at 15% -10%, rgba(232,69,60,.22), transparent 60%),
-      radial-gradient(700px 400px at 95% 10%, rgba(242,181,68,.10), transparent 60%),
-      var(--bg)}
-  .bgfx::after{content:"";position:absolute;inset:0;
-    background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
-    background-size:56px 56px;mask-image:radial-gradient(ellipse 70% 55% at 50% 0%,#000 30%,transparent 100%);opacity:.5}
-
-  .wrap{max-width:var(--max);margin:0 auto;padding:0 24px}
-
-  /* ----- nav ----- */
-  .nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(18,18,20,.72);border-bottom:1px solid var(--line)}
-  .nav .wrap{display:flex;align-items:center;justify-content:space-between;height:64px}
-  .brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:18px;letter-spacing:-.01em}
-  .logo{width:26px;height:26px;border-radius:8px;background:var(--red);display:grid;place-items:center;box-shadow:0 0 0 4px rgba(232,69,60,.15)}
-  .logo i{width:8px;height:8px;border-radius:50%;background:#fff;display:block}
-  .links{display:flex;gap:26px;color:var(--ink-2);font-size:14.5px}
-  .links a:hover{color:var(--ink)}
-  .btn{display:inline-flex;align-items:center;gap:8px;background:var(--red);color:#fff;font-weight:600;padding:12px 18px;border-radius:12px;border:0;cursor:pointer;font-size:15px;transition:transform .15s ease,box-shadow .15s ease,background .15s}
-  .btn:hover{background:var(--red-2);transform:translateY(-1px);box-shadow:0 10px 30px rgba(232,69,60,.35)}
-  .btn.sm{padding:9px 14px;font-size:14px;border-radius:10px}
-  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line-2)}
-  .btn.ghost:hover{background:var(--card-2);box-shadow:none}
-  .btn .arr{transition:transform .15s}.btn:hover .arr{transform:translateX(3px)}
-
-  /* ----- hero ----- */
-  .hero{padding:96px 0 48px;display:grid;grid-template-columns:1.05fr .95fr;gap:56px;align-items:center}
-  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-2);border:1px solid var(--line-2);border-radius:999px;padding:6px 12px;background:var(--card)}
-  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(61,220,132,.15)}
-  h1{font-family:var(--serif);font-weight:400;font-size:clamp(44px,6vw,74px);line-height:1.0;letter-spacing:-.015em;margin:22px 0 20px}
-  h1 em{font-style:italic;color:var(--red-2)}
-  .lead{color:var(--ink-2);font-size:19px;max-width:520px;margin:0 0 30px}
-  .cta{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  .meta{color:var(--ink-3);font-size:13px;margin-top:16px;display:flex;gap:14px;flex-wrap:wrap}
-  .meta b{color:var(--ink-2);font-weight:500}
-
-  /* ----- product mock ----- */
-  .stage{perspective:1600px}
-  .app{background:linear-gradient(180deg,#1b1b1e,#161618);border:1px solid var(--line-2);border-radius:16px;box-shadow:0 40px 100px rgba(0,0,0,.55),0 0 0 1px rgba(0,0,0,.4) inset;transform:rotateY(-10deg) rotateX(4deg);transition:transform .6s cubic-bezier(.2,.8,.2,1);overflow:hidden}
-  .stage:hover .app{transform:rotateY(0) rotateX(0)}
-  .app .tb{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);font-size:12px;color:var(--ink-3)}
-  .app .tb i{width:10px;height:10px;border-radius:50%;background:#333;display:inline-block}
-  .app .tb i:first-child{background:var(--red)}
-  .app .body{padding:18px}
-  .bar{display:flex;gap:8px}
-  .f{flex:1;background:#0f0f11;border:1px solid var(--line-2);border-radius:10px;padding:11px 12px;color:var(--ink-3);font-size:13px;min-height:40px;display:flex;align-items:center}
-  .f.c{flex:0 0 96px}
-  .f .cur{display:inline-block;width:1px;height:14px;background:var(--ink);margin-left:2px;animation:blink 1s steps(2) infinite}
-  .go{background:var(--red);border-radius:10px;padding:0 16px;color:#fff;font-weight:600;font-size:13px;display:flex;align-items:center;transition:background .2s}
-  .go.busy{background:#3a3a3f}
-  .hint{font-size:11.5px;color:var(--ink-3);margin:8px 2px 14px;min-height:16px}
-  .hint.ok{color:var(--green)}
-  .idrow{display:flex;align-items:baseline;gap:12px;margin-top:4px}
-  .idrow span{color:var(--ink-3);font-size:14px}
-  .idrow b{font-family:var(--mono);font-weight:600;color:var(--red-2);font-size:34px;letter-spacing:.02em}
-  .coderow{color:var(--ink-3);font-size:13px;margin-top:2px}.coderow b{font-family:var(--mono);color:var(--ink);font-size:17px;margin-left:8px}
-  .tabs{display:flex;gap:18px;margin:16px 0 10px;font-size:12.5px;color:var(--ink-3)}
-  .tabs b{color:var(--ink);font-weight:500;position:relative}
-  .tabs b::after{content:"";position:absolute;left:0;right:0;bottom:-6px;height:2px;background:var(--red);border-radius:2px}
-  .tiles{display:flex;gap:10px}
-  .tile{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;font-size:12.5px}
-  .tile .mon{width:22px;height:14px;border:2px solid var(--red);border-radius:3px;margin-bottom:10px;position:relative}
-  .tile .mon::after{content:"";position:absolute;left:5px;right:5px;bottom:-6px;height:2px;background:var(--red)}
-  .tile small{display:block;color:var(--red-2);margin-top:6px;font-size:11px}
-
-  /* ----- stats ----- */
-  .stats{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;margin:36px 0 0;background:var(--card)}
-  .stat{padding:22px 24px;border-right:1px solid var(--line)}
-  .stat:last-child{border-right:0}
-  .stat b{display:block;font-family:var(--serif);font-size:40px;line-height:1;font-weight:400}
-  .stat span{color:var(--ink-3);font-size:13px}
-
-  /* ----- sections ----- */
-  section{padding:72px 0 0}
-  .kicker{color:var(--red-2);font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
-  h2{font-family:var(--serif);font-weight:400;font-size:clamp(34px,4.2vw,50px);line-height:1.05;letter-spacing:-.01em;margin:10px 0 12px}
-  h2 em{font-style:italic;color:var(--red-2)}
-  .sub{color:var(--ink-2);font-size:17px;max-width:620px;margin:0 0 34px}
-
-  /* steps */
-  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
-  .step{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:26px}
-  .step .n{font-family:var(--serif);font-size:34px;color:var(--red-2);line-height:1}
-  .step h3{margin:14px 0 6px;font-size:18px;font-weight:600}
-  .step p{margin:0;color:var(--ink-2);font-size:15px}
-
-  /* bento */
-  .bento{display:grid;grid-template-columns:repeat(6,1fr);grid-auto-rows:minmax(180px,auto);gap:16px}
-  .b{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:24px;position:relative;overflow:hidden;transition:transform .25s ease,border-color .25s}
-  .b:hover{transform:translateY(-3px);border-color:var(--line-2)}
-  .b h3{margin:0 0 6px;font-size:18px;font-weight:600}
-  .b p{margin:0;color:var(--ink-2);font-size:14.5px;max-width:34ch}
-  .b.w3{grid-column:span 3}.b.w2{grid-column:span 2}.b.w4{grid-column:span 4}.b.w6{grid-column:span 6}
-  .b .art{position:absolute;right:18px;bottom:16px;opacity:.9}
-  .b.w2 p{max-width:24ch;padding-right:72px}
-  .b.w3 p{max-width:40ch;padding-right:96px}
-  .lock{width:84px;height:84px;position:relative}
-  .lock .sh{position:absolute;left:18px;top:4px;width:48px;height:44px;border:6px solid var(--red);border-bottom:0;border-radius:28px 28px 0 0}
-  .lock .bd{position:absolute;left:4px;top:40px;width:76px;height:50px;border-radius:12px;background:linear-gradient(180deg,var(--red),#b53229)}
-  .lock .kh{position:absolute;left:36px;top:56px;width:12px;height:18px;border-radius:6px;background:#1a1a1c}
-  .spark{display:flex;align-items:flex-end;gap:4px;height:70px}
-  .spark i{width:9px;background:linear-gradient(180deg,var(--red-2),var(--red));border-radius:3px;display:block;animation:grow 1.8s ease-in-out infinite alternate}
-  .sw{width:56px;height:30px;border-radius:999px;background:var(--red);position:relative;display:inline-block;margin-right:8px}
-  .sw::after{content:"";position:absolute;top:4px;right:4px;width:22px;height:22px;border-radius:50%;background:#fff}
-  .sw.off{background:#3a3a3f}.sw.off::after{right:auto;left:4px}
-  .rec{width:64px;height:64px;border-radius:50%;border:4px solid var(--red);display:grid;place-items:center}
-  .rec::after{content:"";width:28px;height:28px;border-radius:50%;background:var(--red);animation:pulse 1.6s ease-in-out infinite}
-  .pill{display:inline-block;font-family:var(--mono);font-size:12px;color:var(--ink-2);border:1px solid var(--line-2);border-radius:8px;padding:4px 8px;margin:4px 6px 0 0}
-
-  /* compare */
-  table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--card);font-size:15px}
-  th,td{padding:16px 18px;text-align:left;border-bottom:1px solid var(--line)}
-  th{color:var(--ink-3);font-weight:500;font-size:13px;letter-spacing:.04em;text-transform:uppercase}
-  tr:last-child td{border-bottom:0}
-  td.y{color:var(--green)} td.n{color:var(--ink-3)}
-  td:first-child{color:var(--ink-2)}
-  th.me,td.me{background:rgba(232,69,60,.08)}
-
-  /* plans */
-  .plans{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-  .plan{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:30px;position:relative}
-  .plan.pro{border-color:rgba(232,69,60,.6);box-shadow:0 0 0 1px rgba(232,69,60,.25),0 30px 80px rgba(232,69,60,.12)}
-  .plan .tag{font-size:13px;color:var(--ink-3)} .plan.pro .tag{color:var(--red-2);font-weight:600}
-  .plan .price{font-family:var(--serif);font-size:56px;line-height:1;margin:10px 0 4px}
-  .plan .price small{font-family:var(--sans);font-size:14px;color:var(--ink-3)}
-  .plan ul{list-style:none;padding:0;margin:18px 0 24px;color:var(--ink-2);font-size:15px}
-  .plan li{padding:7px 0 7px 26px;position:relative}
-  .plan li::before{content:"";position:absolute;left:0;top:13px;width:14px;height:8px;border-left:2px solid var(--green);border-bottom:2px solid var(--green);transform:rotate(-45deg)}
-  .plan .fine{color:var(--ink-3);font-size:12.5px;margin-top:12px}
-  .plan code{font-family:var(--mono);font-size:12px;background:var(--card-2);padding:2px 6px;border-radius:6px}
-
-  /* safety */
-  .safety{display:flex;gap:18px;align-items:flex-start;background:linear-gradient(180deg,rgba(232,69,60,.12),rgba(232,69,60,.04));border:1px solid rgba(232,69,60,.35);border-radius:var(--radius);padding:22px 24px;margin-top:40px}
-  .safety .ic{flex:0 0 40px;height:40px;border-radius:12px;background:var(--red);display:grid;place-items:center;font-weight:700;color:#fff}
-  .safety p{margin:0;color:var(--ink-2);font-size:15px}
-  .safety b{color:var(--ink)}
-
-  /* faq */
-  .faq{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  details{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 20px}
-  summary{cursor:pointer;font-weight:600;list-style:none;display:flex;justify-content:space-between;align-items:center}
-  summary::after{content:"+";color:var(--ink-3);font-size:20px;transition:transform .2s}
-  details[open] summary::after{transform:rotate(45deg)}
-  details p{color:var(--ink-2);margin:10px 0 0;font-size:15px}
-
-  /* footer */
-  footer{border-top:1px solid var(--line);margin-top:80px;padding:34px 0 44px;color:var(--ink-3);font-size:14px}
-  footer .wrap{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
-  footer a:hover{color:var(--ink)}
-  .heart{color:var(--red);display:inline-block;animation:beat 1.6s infinite}
-
-  /* motion */
-  .reveal{opacity:0;transform:translateY(16px);transition:opacity .7s ease,transform .7s ease}
-  .reveal.in{opacity:1;transform:none}
-  @keyframes blink{to{visibility:hidden}}
-  @keyframes beat{0%,20%,40%,100%{transform:scale(1)}10%{transform:scale(1.22)}30%{transform:scale(1.14)}}
-  @keyframes grow{from{height:30%}to{height:100%}}
-  @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.85);opacity:.7}}
-  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.reveal{opacity:1;transform:none}.app{transform:none}}
-  @media (max-width:900px){.hero{grid-template-columns:1fr;padding-top:56px}.links{display:none}.stats{grid-template-columns:1fr 1fr}.stat{border-bottom:1px solid var(--line)}.steps{grid-template-columns:1fr}.bento{grid-template-columns:1fr}.b.w2,.b.w3,.b.w4,.b.w6{grid-column:span 1}.plans{grid-template-columns:1fr}.faq{grid-template-columns:1fr}.app{transform:none}}
-</style>
+<link rel="stylesheet" href="styles.css">
+<script src="boot.js"></script>
+<script src="app.js" defer></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Imperio",
+  "applicationCategory": "UtilitiesApplication",
+  "applicationSubCategory": "Remote desktop",
+  "operatingSystem": "Windows 10, Windows 11",
+  "description": "A one-file remote desktop for Windows. End-to-end encrypted, no install, no account.",
+  "url": "https://devaccindia-hash.github.io/imperio/",
+  "downloadUrl": "https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe",
+  "image": "https://devaccindia-hash.github.io/imperio/og.png",
+  "license": "https://github.com/devaccindia-hash/imperio",
+  "author": { "@type": "Person", "name": "Developer Inayat", "url": "https://developerinayat.com/" },
+  "offers": [
+    { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD" },
+    { "@type": "Offer", "name": "Pro (monthly)", "price": "5", "priceCurrency": "USD" },
+    { "@type": "Offer", "name": "Pro (yearly)", "price": "49", "priceCurrency": "USD" }
+  ]
+}
+</script>
 </head>
 <body>
+<a class="skip" href="#main">Skip to content</a>
 <div class="bgfx" aria-hidden="true"></div>
 
-<nav class="nav">
+<header class="nav">
   <div class="wrap">
-    <a class="brand" href="#"><span class="logo"><i></i></span> Imperio</a>
-    <div class="links"><a href="#how">How it works</a><a href="#why">Why Imperio</a><a href="#compare">Compare</a><a href="#pro">Pricing</a><a href="#faq">FAQ</a></div>
-    <a class="btn sm" href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">Download <span class="arr">→</span></a>
+    <a class="brand" href="#top" aria-label="Imperio, back to top"><span class="logo" aria-hidden="true"><i></i></span> Imperio</a>
+    <nav class="links" id="navLinks" aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#features">Features</a>
+      <a href="#security">Security</a>
+      <a href="#compare">Compare</a>
+      <a href="#pro">Pricing</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <a class="btn sm nav-cta" href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">Download<span class="long">for Windows</span></a>
+    <button class="menu-btn" id="menuBtn" type="button" aria-expanded="false" aria-controls="navLinks" aria-label="Open menu"><span aria-hidden="true"></span></button>
   </div>
-</nav>
+</header>
 
-<main class="wrap">
-  <section class="hero" style="padding-top:88px">
+<main class="wrap" id="main">
+  <div class="hero" id="top">
     <div>
-      <span class="eyebrow"><span class="dot"></span> Windows 10 and 11 · <span id="ver">loading version…</span></span>
+      <span class="eyebrow"><span class="dot" aria-hidden="true"></span> Windows 10 and 11 · <span id="ver">Free download</span></span>
       <h1>Help someone with their computer <em>without being there.</em></h1>
-      <p class="lead">Imperio is a single file. Open it on both computers, type the address shown on the other screen, press Connect — and you are looking at their desktop, with mouse, keyboard and sound.</p>
+      <p class="lead">Imperio is a single file. Open it on both computers, type the address and one-time code shown on the other screen, press Connect — and you are looking at their desktop, with mouse, keyboard and sound.</p>
       <div class="cta">
-        <a class="btn" href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">Download Imperio <span class="arr">→</span></a>
-        <a class="btn ghost" href="#how">See how it works</a>
+        <a class="btn lg" href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">
+          <svg class="win" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M0 0h7.5v7.5H0zM8.5 0H16v7.5H8.5zM0 8.5h7.5V16H0zM8.5 8.5H16V16H8.5z"/></svg>
+          Download Imperio <span class="arr" aria-hidden="true">→</span>
+        </a>
+        <a class="btn lg ghost" href="#how">See how it works</a>
       </div>
-      <div class="meta"><span><b>Free</b> for personal use</span><span><b>No</b> install, no account</span><span><b>Encrypted</b> end to end</span></div>
+      <ul class="meta">
+        <li><span><b>Free</b> for personal use</span></li>
+        <li><span><b>No</b> install, no account</span></li>
+        <li><span><b>Encrypted</b> end to end</span></li>
+        <li><span><b>Open-source</b> client</span></li>
+      </ul>
     </div>
 
     <div class="stage" aria-hidden="true">
       <div class="app">
-        <div class="tb"><i></i><i></i><i></i> Imperio</div>
-        <div class="body">
+        <div class="tb"><span class="ic"></span> Imperio <span class="ctl"><i></i><i></i><i></i></span></div>
+        <div class="ab">
+          <div class="ah"><span class="lg"></span><b>Imperio</b><span class="pl plan-pill">Free plan</span><span class="pl ok">Ready: others can connect to you</span></div>
           <div class="bar">
-            <div class="f" id="mockAddr"><span id="typed"></span><span class="cur"></span></div>
-            <div class="f c" id="mockCode">Code</div>
+            <div class="f" id="mockAddr"><span id="typed">Enter the other computer’s address or ID</span><span class="cur"></span></div>
+            <div class="f c" id="mockCode">Code (if any)</div>
             <div class="go" id="mockGo">Connect</div>
           </div>
-          <div class="hint" id="mockHint">Type the address shown on the other computer.</div>
-          <div class="idrow"><span>Your ID</span><b>425 922 0101</b></div>
-          <div class="coderow">Code <b>739 913</b></div>
+          <div class="hint" id="mockHint">Type the address shown on the other computer’s Imperio window, then Connect.</div>
+          <div class="idrow"><span>Your ID</span><b>425 922 0101</b><span class="gb">Copy</span></div>
+          <div class="coderow">Code <b>739 913</b><span class="gb">Copy</span><span class="gb opt">New code</span></div>
+          <div class="addr">Your address: <b>192.168.1.14:7700</b> (same Wi-Fi / network only)</div>
           <div class="tabs"><b>Saved computers</b><span>Sharing settings</span></div>
           <div class="tiles">
-            <div class="tile"><div class="mon"></div>Mum’s laptop<small>Click to connect</small></div>
-            <div class="tile"><div class="mon"></div>Office PC<small>Click to connect</small></div>
-            <div class="tile" style="opacity:.55"><div class="mon"></div>Workshop<small>Click to connect</small></div>
+            <div class="tile hot"><div class="mon"></div>192.168.1.20<small>Click to connect</small></div>
+            <div class="tile"><div class="mon"></div>100.96.14.7<small>Click to connect</small></div>
+            <div class="tile"><div class="mon"></div>192.168.1.31<small>Click to connect</small></div>
           </div>
         </div>
+      </div>
+      <div class="float"><span class="k"></span><span><b>Encrypted end to end</b>Keys never leave the two computers</span></div>
+    </div>
+  </div>
+
+  <div class="stats reveal">
+    <div class="stat"><b>1</b><span>file, about 11&nbsp;MB. No installer, no account.</span></div>
+    <div class="stat"><b>60</b><span>frames per second, hardware-encoded H.264.</span></div>
+    <div class="stat"><b>~6&nbsp;ms</b><span>capture to display in our local test*</span></div>
+    <div class="stat"><b>0</b><span>people in the middle who can watch — not even us.</span></div>
+  </div>
+  <p class="foot">*Measured on our own test machine. A real network adds its own delay on top; your numbers will differ.</p>
+
+  <section id="how" aria-labelledby="how-h">
+    <div class="head reveal">
+      <div class="kicker">How it works</div>
+      <h2 id="how-h">Three steps. <em>No settings.</em></h2>
+      <p class="sub">Both computers run the same file. Whoever needs help shares; whoever helps connects.</p>
+    </div>
+    <ol class="steps">
+      <li class="step reveal"><h3>Open Imperio on both PCs</h3><p>Double-click Imperio.exe. Sharing is ready the moment the window appears — the ID, the address and a one-time six-digit code are shown in big letters.</p></li>
+      <li class="step reveal"><h3>Type the other PC’s address</h3><p>On the computer you are sitting at, enter the address and code you were told, then press Connect. The other person can be asked to click Yes first.</p></li>
+      <li class="step reveal"><h3>Work as if you were there</h3><p>Their screen opens in its own window. Mouse, keyboard, clipboard text and sound just work. F11 for full screen; close the window to end.</p></li>
+    </ol>
+  </section>
+
+  <section id="features" aria-labelledby="feat-h">
+    <div class="head reveal">
+      <div class="kicker">Features</div>
+      <h2 id="feat-h">Everything you need. <em>Nothing you don’t.</em></h2>
+      <p class="sub">No surprise lockouts, no account harvesting, no mystery servers in the middle. Just the connection you asked for.</p>
+    </div>
+    <div class="bento">
+      <article class="b w3 reveal"><h3>Fast enough to forget it’s remote</h3><p>Hardware H.264 encoding and decoding at 60 frames per second, with a bitrate that adapts when the link gets slower.</p><div class="art spark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+      <article class="b w3 reveal"><h3>Private by construction</h3><p>Every session gets fresh keys agreed only between the two computers. What travels in between is unreadable to anyone else.</p><div class="art" aria-hidden="true"><div class="cipher">9f3a <b>c41e</b> 07bd e2a9 51c8 <b>6d0f</b> b37a 18e4 a2c9 <b>4f71</b> d05b 93ee 7a1c<br>e84b 2d96 <b>1f0a</b> c7d3 5b62 08af <b>9e15</b> 3c70 f4d8 61ab <b>27c5</b> 0b9d e36f</div></div></article>
+      <article class="b w2 reveal"><h3>You decide who gets in</h3><p>Pause sharing with one switch. Ask for a Yes / No before anyone connects. Or allow only your own Tailscale devices.</p><div class="art" aria-hidden="true"><span class="sw"></span><span class="sw off"></span></div></article>
+      <article class="b w2 reveal"><h3>Every screen, plus sound</h3><p>Switch between the other computer’s displays from the menu or with Ctrl+Shift+1…9. Its audio plays on your side.</p><div class="art" aria-hidden="true"><div class="mons"><i></i><i></i></div></div></article>
+      <article class="b w2 reveal"><h3>Record a session</h3><p>Save any session as an MP4 for support notes or training — on demand, or always.</p><div class="art" aria-hidden="true"><div class="rec"></div></div></article>
+      <article class="b w3 reveal"><h3>Copy here, paste there</h3><p>Clipboard text follows you in both directions, so a link, a command or an error message is one Ctrl+V away.</p><div class="art" aria-hidden="true"><span class="pill">Ctrl + C</span><span class="pill">→</span><span class="pill">Ctrl + V</span></div></article>
+      <article class="b w3 reveal"><h3>Honest billing</h3><p>Free is free, including the occasional work task. No “commercial use detected” lockouts. Pro is a key you paste once.</p><div class="art" aria-hidden="true"><span class="pill gold">IMP-…</span><span class="pill">checked offline</span></div></article>
+      <article class="b w6 row reveal"><div><h3>Nothing to install, nothing to clean up</h3><p>One portable file that updates itself. Keep it on a USB stick, in Downloads, anywhere. Close the window and it waits in the tray.</p></div><div class="art" aria-hidden="true"><span class="pill">Imperio.exe · 11 MB</span><span class="pill">self-updating</span><span class="pill">tray icon</span><span class="pill">Windows 10 / 11</span></div></article>
+    </div>
+  </section>
+
+  <section id="security" aria-labelledby="sec-h">
+    <div class="head reveal">
+      <div class="kicker">Security</div>
+      <h2 id="sec-h">Built around <em>trust,</em> not tricks.</h2>
+      <p class="sub">Remote control is a serious permission. Here is exactly what protects a session, in plain words, with the names of the real building blocks so you can check them.</p>
+    </div>
+    <div class="sec">
+      <ol class="chain reveal">
+        <li><span class="n" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 10v4M12 10v4M15.5 10v4"/></svg></span><div><h3>A one-time code only the two of you know</h3><p>The six-digit code is never sent. Both sides prove they know it with <code>SPAKE2</code>, a password-authenticated key exchange: someone listening learns nothing, and someone guessing gets one try per attempt before the host slows down and issues a new code.</p></div></li>
+        <li><span class="n" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span><div><h3>End-to-end encryption, every packet</h3><p>Screen, sound, keystrokes and clipboard are sealed with <code>ChaCha20-Poly1305</code> using fresh keys for each session and each direction. Nothing in between can read or alter them.</p></div></li>
+        <li><span class="n" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg></span><div><h3>The same computer as last time</h3><p>Each computer has its own <code>Ed25519</code> identity. Your Imperio remembers it on first contact; if a different machine answers later, the connection is refused instead of quietly going ahead.</p></div></li>
+        <li><span class="n" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.6-3.6 3.400-6 7-6s6.400 2.400 7 6"/></svg></span><div><h3>A person says Yes</h3><p>Turn on “Ask me before someone connects” and nothing is shown or controlled until the person at the computer approves. For unattended access you can add a second factor from an authenticator app (<code>TOTP</code>).</p></div></li>
+        <li><span class="n" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10M8 10l4 4 4-4"/><path d="M5 19h14"/></svg></span><div><h3>Updates you can verify</h3><p>The update manifest is signed with the project’s <code>Ed25519</code> release key and the download is checked against its <code>SHA-256</code> before it is installed. A tampered file is rejected.</p></div></li>
+        <li><span class="n" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 8l-4 4 4 4M15 8l4 4-4 4"/></svg></span><div><h3>Open-source client</h3><p>The program you run is published under MIT / Apache-2.0. You do not have to take any of the above on faith — <a href="https://github.com/devaccindia-hash/imperio" rel="noopener noreferrer"><u>read the source</u></a>.</p></div></li>
+      </ol>
+      <div class="side">
+        <div class="reveal">
+          <div class="dlg" aria-hidden="true">
+            <div class="t"><span>Imperio — allow remote access?</span><span>✕</span></div>
+            <div class="m"><span class="w"></span><div><p>Someone at 192.168.1.20:51844 is asking to control this computer.</p><p>Only allow people you contacted yourself and trust. If someone phoned you and told you to do this, it is a scam — choose No.</p><p>Allow this remote session?</p></div></div>
+            <div class="a"><span>Yes</span><span>No</span></div>
+          </div>
+          <p class="cap foot">The consent prompt shown on the shared computer when “Ask me before someone connects” is on.</p>
+        </div>
+        <div class="safety reveal" role="note"><div class="ic" aria-hidden="true">!</div><p><b>Stay safe.</b> Only let people you contacted yourself connect. No bank, Microsoft or tax office will ever ask you to install Imperio or read out your code. If someone phoned you and told you to do this, hang up.</p></div>
       </div>
     </div>
   </section>
 
-  <div class="stats reveal">
-    <div class="stat"><b>1</b><span>file. No installer, no account.</span></div>
-    <div class="stat"><b>60</b><span>frames per second, hardware encoded.</span></div>
-    <div class="stat"><b>~6 ms</b><span>screen to screen on a home network*</span></div>
-    <div class="stat"><b>0</b><span>people who can watch — not even us.</span></div>
-  </div>
-  <p style="color:var(--ink-3);font-size:12.5px;margin:10px 2px 0">*Measured capture-to-display on a local network in our tests. Internet speed adds its own delay.</p>
-
-  <section id="how">
-    <div class="kicker">How it works</div>
-    <h2>Three steps. <em>No settings.</em></h2>
-    <p class="sub">Both computers run the same file. Whoever needs help shares; whoever helps connects.</p>
-    <div class="steps">
-      <div class="step reveal"><div class="n">1</div><h3>Open Imperio on both PCs</h3><p>Double-click Imperio.exe. Sharing is ready the moment the window appears — the ID, address and a one-time code are shown in big letters.</p></div>
-      <div class="step reveal"><div class="n">2</div><h3>Type the other PC’s address</h3><p>On the computer you are sitting at, enter the address (and code) you were told, then press Connect. The other person can be asked to click Yes first.</p></div>
-      <div class="step reveal"><div class="n">3</div><h3>Work as if you were there</h3><p>Their screen opens in its own window. Mouse, keyboard, clipboard and sound just work. F11 for full screen; close the window to end.</p></div>
+  <section id="compare" aria-labelledby="cmp-h">
+    <div class="head reveal">
+      <div class="kicker">Compare</div>
+      <h2 id="cmp-h">What you give up <em>elsewhere.</em></h2>
+      <p class="sub">The big names are fine products. They also ask for accounts, installers, and the right to decide whether your usage looks “commercial”.</p>
     </div>
+    <div class="tablebox reveal">
+      <table>
+        <caption class="sr">Imperio compared with AnyDesk and TeamViewer</caption>
+        <thead><tr><th scope="col"><span class="sr">Feature</span></th><th scope="col" class="me">Imperio</th><th scope="col">AnyDesk</th><th scope="col">TeamViewer</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Setup</th><td class="me y" data-l="Imperio">One file, no install</td><td data-l="AnyDesk">Installer or portable</td><td data-l="TeamViewer">Installer</td></tr>
+          <tr><th scope="row">Account needed</th><td class="me y" data-l="Imperio">No</td><td data-l="AnyDesk">Optional</td><td data-l="TeamViewer">Yes, for most features</td></tr>
+          <tr><th scope="row">Free plan blocks “commercial use” automatically</th><td class="me y" data-l="Imperio">Never</td><td data-l="AnyDesk">Yes</td><td data-l="TeamViewer">Yes</td></tr>
+          <tr><th scope="row">End-to-end encryption</th><td class="me y" data-l="Imperio">Always</td><td data-l="AnyDesk">Yes</td><td data-l="TeamViewer">Yes</td></tr>
+          <tr><th scope="row">Session recording</th><td class="me y" data-l="Imperio">Included, free</td><td data-l="AnyDesk">Yes</td><td data-l="TeamViewer">Yes</td></tr>
+          <tr><th scope="row">Client source code</th><td class="me y" data-l="Imperio">Open (MIT / Apache-2.0)</td><td data-l="AnyDesk">Closed</td><td data-l="TeamViewer">Closed</td></tr>
+          <tr><th scope="row">Connect across the internet without a VPN</th><td class="me" data-l="Imperio">Not yet — relay coming</td><td data-l="AnyDesk">Yes</td><td data-l="TeamViewer">Yes</td></tr>
+          <tr><th scope="row">Pro price</th><td class="me y" data-l="Imperio">$5 / month</td><td data-l="AnyDesk">from ~$14.90 / month</td><td data-l="TeamViewer">from ~$24.90 / month</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="foot">Competitor details from their public pricing pages at the time of writing; check their sites for current terms.</p>
   </section>
 
-  <section id="why">
-    <div class="kicker">Why Imperio</div>
-    <h2>Built around <em>trust,</em> not tricks.</h2>
-    <p class="sub">No surprise lockouts, no account harvesting, no mystery servers in the middle. Just the connection you asked for.</p>
-    <div class="bento">
-      <div class="b w3 reveal"><h3>Encrypted end to end</h3><p>Every session gets a fresh key agreed only between the two computers. Each machine’s identity is pinned, so a swapped machine is noticed and refused.</p><div class="art"><div class="lock"><div class="sh"></div><div class="bd"></div><div class="kh"></div></div></div></div>
-      <div class="b w3 reveal"><h3>Fast enough to forget it’s remote</h3><p>Hardware video encoding on both ends, 60 fps, a handful of milliseconds on a local network, adaptive to slower links.</p><div class="art spark"><i style="animation-delay:0s"></i><i style="animation-delay:.2s"></i><i style="animation-delay:.4s"></i><i style="animation-delay:.1s"></i><i style="animation-delay:.3s"></i><i style="animation-delay:.5s"></i><i style="animation-delay:.25s"></i></div></div>
-      <div class="b w2 reveal"><h3>You decide who gets in</h3><p>Pause sharing with one switch. Ask for a Yes/No before anyone connects. Or allow only your own Tailscale devices.</p><div class="art"><span class="sw"></span><span class="sw off"></span></div></div>
-      <div class="b w2 reveal"><h3>Record a session</h3><p>Save any session as an MP4 for support notes or training — on demand, or always.</p><div class="art"><div class="rec"></div></div></div>
-      <div class="b w2 reveal"><h3>Honest billing</h3><p>Free is free, including the occasional work task. No “commercial use detected” lockouts. Pro is a key you paste once.</p><div class="art"><span class="pill">IMP-…</span></div></div>
-      <div class="b w6 reveal" style="display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:center"><div><h3>Nothing to install, nothing to clean up</h3><p>One portable file that updates itself. Keep it on a USB stick, in Downloads, anywhere. Works on Windows 10 and 11.</p></div><div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end"><span class="pill">Imperio.exe · 11 MB</span><span class="pill">no admin for viewers</span><span class="pill">self-updating</span><span class="pill">tray icon</span></div></div>
+  <section id="pro" aria-labelledby="pro-h">
+    <div class="head reveal">
+      <div class="kicker">Pricing</div>
+      <h2 id="pro-h">Free for people. <em>Pro</em> for professionals.</h2>
+      <p class="sub">Help family and friends for free, forever. If Imperio is part of your working day, Pro keeps the lights on.</p>
     </div>
-
-    <div class="safety reveal"><div class="ic">!</div><p><b>Stay safe.</b> Only let people you contacted yourself connect. No bank, Microsoft or tax office will ever ask you to install Imperio or read out your code. If someone phoned you and told you to do this, hang up.</p></div>
-  </section>
-
-  <section id="compare">
-    <div class="kicker">Compare</div>
-    <h2>What you give up <em>elsewhere.</em></h2>
-    <p class="sub">The big names are fine products. They also ask for accounts, installers, and the right to decide whether your usage looks “commercial”.</p>
-    <div class="reveal" style="overflow:auto">
-    <table>
-      <thead><tr><th></th><th class="me">Imperio</th><th>AnyDesk</th><th>TeamViewer</th></tr></thead>
-      <tbody>
-        <tr><td>Setup</td><td class="me y">One file, no install</td><td>Installer or portable</td><td>Installer</td></tr>
-        <tr><td>Account needed</td><td class="me y">No</td><td>Optional</td><td>Yes, for most features</td></tr>
-        <tr><td>Free plan blocks “commercial use” automatically</td><td class="me y">Never</td><td class="n">Yes</td><td class="n">Yes</td></tr>
-        <tr><td>End-to-end encryption</td><td class="me y">Always</td><td class="y">Yes</td><td class="y">Yes</td></tr>
-        <tr><td>Session recording</td><td class="me y">Included</td><td class="y">Yes</td><td class="y">Yes</td></tr>
-        <tr><td>Pro price</td><td class="me">$5 / month</td><td>from ~$14.90 / month</td><td>from ~$24.90 / month</td></tr>
-      </tbody>
-    </table>
-    </div>
-    <p style="color:var(--ink-3);font-size:12.5px;margin-top:10px">Competitor details from their public pricing pages at the time of writing; check their sites for current terms.</p>
-  </section>
-
-  <section id="pro">
-    <div class="kicker">Pricing</div>
-    <h2>Free for people. <em>Pro</em> for professionals.</h2>
-    <p class="sub">Help family and friends for free, forever. If Imperio is part of your working day, Pro keeps the lights on.</p>
     <div class="plans">
       <div class="plan reveal">
         <div class="tag">Free</div>
         <div class="price">$0 <small>forever</small></div>
+        <p class="for">For personal use and the occasional work task.</p>
         <ul><li>Everything: control, sound, clipboard, recording</li><li>Encrypted sessions, pinned identities</li><li>Occasional business use is fine</li><li>Self-updating</li></ul>
-        <a class="btn ghost" href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">Download</a>
+        <a class="btn ghost" href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">Download free</a>
       </div>
       <div class="plan pro reveal">
-        <div class="tag">Pro</div>
+        <div class="tag">Pro <span class="badge">for daily work</span></div>
         <div class="price">$5 <small>per month · or $49 per year</small></div>
+        <p class="for">For people who use Imperio as part of their job.</p>
         <ul><li>Daily professional use, unlimited sessions</li><li>Priority help from the developer</li><li>Early access to new features</li><li>You keep the software honest and independent</li></ul>
-        <a class="btn" href="mailto:admin@developerinayat.com?subject=Imperio%20Pro%20licence">Get a Pro key <span class="arr">→</span></a>
-        <p class="fine">You receive a key starting with <code>IMP-</code>. Paste it under <b>Sharing settings → Plan</b>. No account, no phone-home: the key is checked on your own computer.</p>
+        <a class="btn gold" href="mailto:admin@developerinayat.com?subject=Imperio%20Pro%20licence">Get a Pro key <span class="arr" aria-hidden="true">→</span></a>
+        <p class="fine">You receive a key starting with <code>IMP-</code> by email. Paste it under <b>Sharing settings → Plan</b>. No account, no phone-home: the key is checked on your own computer.</p>
       </div>
     </div>
   </section>
 
-  <section id="faq">
-    <div class="kicker">Questions</div>
-    <h2>Things people <em>ask.</em></h2>
+  <section id="faq" aria-labelledby="faq-h">
+    <div class="head reveal">
+      <div class="kicker">Questions</div>
+      <h2 id="faq-h">Things people <em>ask.</em></h2>
+    </div>
     <div class="faq">
       <details class="reveal"><summary>Do both computers need Imperio?</summary><p>Yes. It is the same file for both roles: the computer being controlled and the one you sit at.</p></details>
-      <details class="reveal"><summary>Does it work over the internet?</summary><p>Yes, whenever the host’s address is reachable: same network, or both PCs on your Tailscale network (free). Direct internet connections through our relay are coming next.</p></details>
-      <details class="reveal"><summary>Windows SmartScreen shows a warning. Normal?</summary><p>For a new, not-yet-signed program, yes. Click “More info” → “Run anyway”. Code signing is on the roadmap and will make the warning disappear.</p></details>
+      <details class="reveal"><summary>Does it work over the internet?</summary><p>Yes, whenever the other computer’s address is reachable: on the same network, or with both PCs on your Tailscale network (free). Direct internet connections through our own relay are coming next.</p></details>
+      <details class="reveal"><summary>Windows SmartScreen shows a warning. Normal?</summary><p>For a new, not-yet-signed program, yes. Click “More info” → “Run anyway”. Code signing is on the roadmap and will make the warning disappear. Until then you can compare the file’s SHA-256 with the one published at the bottom of this page.</p></details>
+      <details class="reveal"><summary>Is it safe to leave running?</summary><p>Nobody can connect without the current one-time code, and a few wrong guesses replace it. You can pause sharing with one switch, require a Yes / No on every connection, or quit from the tray icon.</p></details>
       <details class="reveal"><summary>Where do recordings go?</summary><p>Videos ▸ Imperio, as MP4 files named by date and time. Turn recording on per session from the session menu, or always, in Sharing settings.</p></details>
-      <details class="reveal"><summary>How do updates work?</summary><p>Imperio checks for a new version when it starts and shows a banner (and a tray notification if it is running in the background). Click “Download and install”: it verifies the download and restarts itself.</p></details>
-      <details class="reveal"><summary>What does the developer see?</summary><p>Nothing about your sessions. The only network request the app makes on its own is to read a small version file to offer updates.</p></details>
+      <details class="reveal"><summary>How do updates work?</summary><p>Imperio checks for a new version when it starts and shows a banner (and a tray notification if it is running in the background). Click “Download and install”: it verifies the signature and checksum, then restarts itself.</p></details>
+      <details class="reveal"><summary>What does the developer see?</summary><p>Nothing about your sessions. The only network request the app makes on its own is to read a small version file to offer updates. This website uses no cookies, no analytics and no third-party scripts or fonts.</p></details>
+      <details class="reveal"><summary>How do I get and use a Pro key?</summary><p>Email <a href="mailto:admin@developerinayat.com?subject=Imperio%20Pro%20licence"><u>admin@developerinayat.com</u></a>. You receive a key starting with <code>IMP-</code>; paste it under Sharing settings → Plan. It is verified on your computer, with no licence server.</p></details>
     </div>
   </section>
+
+  <div class="final reveal">
+    <h2>Be there in a minute, <em>from anywhere you are.</em></h2>
+    <p class="sub">One file on each computer. No install, no account, no card.</p>
+    <div class="cta">
+      <a class="btn lg" href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">
+        <svg class="win" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M0 0h7.5v7.5H0zM8.5 0H16v7.5H8.5zM0 8.5h7.5V16H0zM8.5 8.5H16V16H8.5z"/></svg>
+        Download Imperio <span class="arr" aria-hidden="true">→</span>
+      </a>
+      <a class="btn lg ghost" href="https://github.com/devaccindia-hash/imperio" rel="noopener noreferrer">View the source</a>
+    </div>
+    <p class="verify">Verify your download<span id="shaver"></span>: in PowerShell run <code>Get-FileHash Imperio.exe</code> and compare with this SHA-256.
+      <span class="hash" id="sha">Loading checksum…</span></p>
+  </div>
 </main>
 
 <footer>
   <div class="wrap">
-    <div>Proudly made with <span class="heart">♥</span> in India by <a href="https://developerinayat.com/" style="color:var(--red-2)">Developer Inayat</a></div>
-    <div><a href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">Download</a> &nbsp;·&nbsp; <a href="latest.json">Release info</a> &nbsp;·&nbsp; <a href="mailto:admin@developerinayat.com">Contact</a></div>
+    <div class="fgrid">
+      <div>
+        <a class="brand" href="#top"><span class="logo" aria-hidden="true"><i></i></span> Imperio</a>
+        <p>A one-file remote desktop for Windows. Encrypted end to end, free for personal use, honest about the rest.</p>
+      </div>
+      <nav aria-label="Product">
+        <h4>Product</h4>
+        <ul>
+          <li><a href="https://github.com/devaccindia-hash/imperio/releases/latest/download/Imperio.exe">Download</a></li>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#pro">Pricing</a></li>
+          <li><a href="https://github.com/devaccindia-hash/imperio/releases" rel="noopener noreferrer">Release notes</a></li>
+        </ul>
+      </nav>
+      <nav aria-label="Trust">
+        <h4>Trust</h4>
+        <ul>
+          <li><a href="#security">Security</a></li>
+          <li><a href="https://github.com/devaccindia-hash/imperio" rel="noopener noreferrer">Source code</a></li>
+          <li><a href="latest.json">Signed release info</a></li>
+        </ul>
+      </nav>
+      <nav aria-label="Help">
+        <h4>Help</h4>
+        <ul>
+          <li><a href="#faq">FAQ</a></li>
+          <li><a href="mailto:admin@developerinayat.com">Contact</a></li>
+          <li><a href="https://github.com/devaccindia-hash/imperio/issues" rel="noopener noreferrer">Report a problem</a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="fbot">
+      <div>Proudly made with <span class="heart" aria-label="love">♥</span> in India by <a href="https://developerinayat.com/" rel="noopener">Developer Inayat</a></div>
+      <div>Client licensed MIT / Apache-2.0 · Not affiliated with AnyDesk or TeamViewer.</div>
+    </div>
   </div>
 </footer>
-
-<script>
-  // Version from the signed manifest the app also reads.
-  fetch('latest.json',{cache:'no-store'}).then(r=>r.json()).then(m=>{
-    document.getElementById('ver').textContent='Version '+m.version;
-  }).catch(()=>{document.getElementById('ver').textContent='Free download';});
-
-  // Scroll reveal.
-  const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.12});
-  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
-
-  // Hero mock: type an address, connect, show the result, repeat.
-  const typed=document.getElementById('typed'),go=document.getElementById('mockGo'),hint=document.getElementById('mockHint'),code=document.getElementById('mockCode');
-  const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const addr='192.168.1.20';
-  function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
-  async function loop(){
-    if(reduce){typed.textContent=addr;code.textContent='739 913';hint.textContent='Connected. The remote screen is open in its own window.';hint.className='hint ok';return}
-    for(;;){
-      typed.textContent='';code.textContent='Code';go.textContent='Connect';go.className='go';hint.textContent='Type the address shown on the other computer.';hint.className='hint';
-      await sleep(900);
-      for(const ch of addr){typed.textContent+=ch;await sleep(70+Math.random()*60)}
-      await sleep(400);code.textContent='739 913';await sleep(500);
-      go.textContent='Connecting…';go.className='go busy';hint.textContent='Reaching the other computer…';
-      await sleep(1100);
-      go.textContent='Session open';hint.textContent='Connected — encrypted end to end. F11 for full screen.';hint.className='hint ok';
-      await sleep(3600);
-    }
-  }
-  loop();
-</script>
 </body>
 </html>

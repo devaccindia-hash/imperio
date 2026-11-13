@@ -74,6 +74,19 @@ pub enum ControlMessage {
     },
     /// Either side is leaving.
     Bye,
+    // --- Variants below were added after protocol version 3. They are
+    // appended so older peers (which cannot decode them) simply ignore them.
+    /// Host refuses the session and says why (wrong second factor, the person
+    /// at the computer chose No, version mismatch). Followed by `Bye`.
+    Denied(String),
+    /// One piece of a clipboard text too large for a single datagram. Pieces
+    /// of the same `id` are concatenated in `index` order (UTF-8 bytes).
+    ClipboardChunk {
+        id: u32,
+        index: u16,
+        count: u16,
+        data: Vec<u8>,
+    },
 }
 
 impl ControlMessage {

@@ -139,7 +139,15 @@ pub fn download_and_stage(a: &Available) -> Result<PathBuf, String> {
     }
     let dir = staging_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let path = dir.join(format!("Imperio-{}.exe", a.version));
+    // The version comes from a signed manifest, but it still becomes part of
+    // a file name: keep only characters that cannot change the path.
+    let safe_version: String = a
+        .version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        .take(32)
+        .collect();
+    let path = dir.join(format!("Imperio-{safe_version}.exe"));
     std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(path)
 }
@@ -180,6 +188,10 @@ pub fn apply_update_main(args: &[String]) -> anyhow::Result<()> {
         }
     }
     if let Some(e) = last_err {
+        // Could not swap the file (read-only folder, antivirus lock). Bring
+        // the old version back up rather than leaving the user with nothing;
+        // it will offer the update again.
+        let _ = std::process::Command::new(&target).spawn();
         anyhow::bail!("could not replace {}: {e}", target.display());
     }
     // `--updated` lets the new instance greet the user with its version.

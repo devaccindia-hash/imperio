@@ -126,7 +126,7 @@ fn capture_loop(tx: &SyncSender<Vec<i16>>, stop: &AtomicBool) -> anyhow::Result<
                     let sample_count = frames as usize * src_ch as usize;
                     if silent || data.is_null() {
                         // Emit silence so the viewer's clock keeps advancing.
-                        pending.extend(std::iter::repeat(0i16).take(frames as usize * CHANNELS as usize));
+                        pending.extend(std::iter::repeat_n(0i16, frames as usize * CHANNELS as usize));
                     } else if is_float {
                         let src = std::slice::from_raw_parts(data as *const f32, sample_count);
                         f32_to_i16(src, &mut i16s);

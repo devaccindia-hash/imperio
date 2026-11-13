@@ -266,8 +266,11 @@ impl ImperioApp {
         let exe = std::env::current_exe().unwrap_or_else(|_| "imperio.exe".into());
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("session").arg(&target);
+        // The code travels in the child's environment, not on its command
+        // line (which any process on this PC could read from the task list).
+        cmd.env_remove(crate::SESSION_CODE_ENV);
         if !code.is_empty() {
-            cmd.arg("--code").arg(&code);
+            cmd.env(crate::SESSION_CODE_ENV, &code);
         }
         if self.trust_new {
             cmd.arg("--trust-new");
@@ -310,12 +313,14 @@ impl ImperioApp {
                     if status.success() {
                         Ok(())
                     } else {
-                        Err(err
-                            .lines()
-                            .rev()
-                            .find(|l| !l.trim().is_empty())
-                            .unwrap_or("the session ended with an error")
-                            .to_string())
+                        // The child explains itself on stderr, sometimes over
+                        // a few lines; show all of it, on one wrapped line.
+                        let text = err.split_whitespace().collect::<Vec<_>>().join(" ");
+                        Err(if text.is_empty() {
+                            "The session ended unexpectedly.".to_string()
+                        } else {
+                            text.chars().take(600).collect()
+                        })
                     }
                 })();
                 *session.lock().unwrap() = match outcome {
@@ -489,8 +494,13 @@ impl eframe::App for ImperioApp {
                 );
             }
         }
-        if self.copied.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(200));
+        // "Copied" reverts to "Copy" after a moment; repaint only until then.
+        match self.copied {
+            Some((_, at)) if at.elapsed() < Duration::from_millis(1500) => {
+                ctx.request_repaint_after(Duration::from_millis(200))
+            }
+            Some(_) => self.copied = None,
+            None => {}
         }
         let status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
         let host_error = self.host_error.lock().ok().and_then(|e| e.clone());
@@ -666,7 +676,7 @@ impl ImperioApp {
                                 // Two deliberate clicks: the first arms the button
                                 // for a few seconds, the second installs. A single
                                 // stray press can never start an update.
-                                let armed = self.confirm_until.map_or(false, |t| t > Instant::now());
+                                let armed = self.confirm_until.is_some_and(|t| t > Instant::now());
                                 let label = if armed { "Click again to confirm" } else { "Download and install" };
                                 let install = egui::Button::new(RichText::new(label).size(13.5).strong().color(Color32::WHITE))
                                     .fill(if armed { accent_hover() } else { accent() })
@@ -720,7 +730,12 @@ impl ImperioApp {
         });
         ui.allocate_ui_with_layout(Vec2::new(w, 36.0), centered, |ui| {
             if let Some(code) = &status.code {
-                let shown = format!("{} {}", &code[..code.len().min(3)], &code[code.len().min(3)..]);
+                // "123 456" for the usual six digits; anything else as it is.
+                let shown = if code.len() == 6 && code.is_ascii() {
+                    format!("{} {}", &code[..3], &code[3..])
+                } else {
+                    code.clone()
+                };
                 ui.label(RichText::new("Code").size(16.0).color(MUTED));
                 ui.add_space(10.0);
                 ui.label(RichText::new(shown).size(26.0).strong().color(TEXT));
@@ -957,7 +972,7 @@ impl ImperioApp {
                 self.check_updates();
             }
             if let UpdateState::Available(a) | UpdateState::Dismissed(a) = &upd {
-                let armed = self.confirm_until.map_or(false, |t| t > Instant::now());
+                let armed = self.confirm_until.is_some_and(|t| t > Instant::now());
                 let label = if armed { "Click again to confirm".to_string() } else { format!("Install {}", a.version) };
                 let install = egui::Button::new(RichText::new(label).size(13.0).strong().color(Color32::WHITE))
                     .fill(if armed { accent_hover() } else { accent() })
@@ -1079,12 +1094,19 @@ fn pill(ui: &mut egui::Ui, color: Color32, text: &str) {
 /// A small heart drawn with the painter (the bundled fonts lack the glyph),
 /// with a gentle heartbeat.
 fn heart(ui: &mut egui::Ui, size: f32, color: Color32) {
+    const PERIOD: f64 = 1.6;
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let t = ui.input(|i| i.time);
-    let phase = (t % 1.6) / 1.6;
+    let (t, focused) = ui.input(|i| (i.time, i.focused));
+    // The heartbeat only runs while the window is in front, and only redraws
+    // during the two beats: an idle or background Imperio must not keep the
+    // GPU and CPU awake 30 times a second for a decoration.
+    let phase = if focused { (t % PERIOD) / PERIOD } else { 0.5 };
     let beat = |center: f64| (1.0 - ((phase - center).abs() / 0.09)).max(0.0);
     let scale = 1.0 + 0.16 * (beat(0.10) + 0.7 * beat(0.30)) as f32;
-    ui.ctx().request_repaint_after(Duration::from_millis(33));
+    if focused {
+        let wait = if phase < 0.40 { 0.033 } else { (1.0 - phase) * PERIOD };
+        ui.ctx().request_repaint_after(Duration::from_secs_f64(wait));
+    }
     let p = ui.painter();
     let c = rect.center();
     let r = size * 0.27 * scale;

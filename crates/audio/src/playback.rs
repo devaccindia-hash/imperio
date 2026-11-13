@@ -146,9 +146,7 @@ unsafe fn write_samples(
             n => {
                 stereo.push(l);
                 stereo.push(r);
-                for _ in 2..n {
-                    stereo.push(0);
-                }
+                stereo.extend(std::iter::repeat_n(0, n as usize - 2));
             }
         }
     }

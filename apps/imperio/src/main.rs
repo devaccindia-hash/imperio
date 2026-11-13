@@ -31,13 +31,13 @@ fn main() -> anyhow::Result<()> {
         Some("release-sign") => {
             attach_console();
             let path = raw.get(1).ok_or_else(|| anyhow::anyhow!("usage: imperio release-sign <latest.json> --key <seed> [--exe <Imperio.exe>]"))?;
-            let seed = flag(&raw, "--key").ok_or_else(|| anyhow::anyhow!("--key <seed> is required"))?;
+            let seed = signing_key(&raw)?;
             let exe = flag(&raw, "--exe").map(std::path::PathBuf::from);
             update::sign_manifest_file(std::path::Path::new(path), &seed, exe.as_deref())
         }
         Some("license-sign") => {
             attach_console();
-            let seed = flag(&raw, "--key").ok_or_else(|| anyhow::anyhow!("--key <seed> is required"))?;
+            let seed = signing_key(&raw)?;
             let lic = license::License {
                 name: flag(&raw, "--name").unwrap_or_default(),
                 plan: flag(&raw, "--plan").unwrap_or_else(|| "pro".into()),
@@ -86,10 +86,15 @@ fn session_child(args: Vec<String>) -> anyhow::Result<()> {
             let _ = std::io::stdout().flush();
         })),
     };
+    // The home window hands the code over in the environment rather than on
+    // the command line, where any process could read it from the task list.
+    req.code = std::env::var(SESSION_CODE_ENV).ok().filter(|c| !c.is_empty());
+    std::env::remove_var(SESSION_CODE_ENV);
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--code" => req.code = it.next(),
+            "--totp" => req.totp = it.next(),
             "--server" => req.server = it.next(),
             "--trust-new" => req.trust_new = true,
             "--no-input" => req.send_input = false,
@@ -103,6 +108,19 @@ fn session_child(args: Vec<String>) -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Environment variable carrying the session code to the `session` child.
+pub const SESSION_CODE_ENV: &str = "IMPERIO_SESSION_CODE";
+
+/// Environment variable carrying the owner's private signing seed, so it does
+/// not have to appear on a command line (`--key` still works).
+const SIGNING_KEY_ENV: &str = "IMPERIO_SIGNING_KEY";
+
+fn signing_key(args: &[String]) -> anyhow::Result<String> {
+    flag(args, "--key")
+        .or_else(|| std::env::var(SIGNING_KEY_ENV).ok().filter(|k| !k.trim().is_empty()))
+        .ok_or_else(|| anyhow::anyhow!("the private seed is required: set {SIGNING_KEY_ENV} or pass --key <seed>"))
 }
 
 /// Value of `--name <value>` in `args`, if present.

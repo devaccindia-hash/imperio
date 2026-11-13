@@ -55,8 +55,10 @@ $manifest = @{ version = $version; url = $url; sha256 = ""; notes = $Notes; sig 
 $latest = Join-Path $repoDir "site\latest.json"
 [System.IO.File]::WriteAllText($latest, $manifest, (New-Object System.Text.UTF8Encoding $false))
 
-# Imperio.exe is a GUI-subsystem program: wait for it explicitly.
-$sign = Start-Process -FilePath $exe -ArgumentList @("release-sign", "`"$latest`"", "--key", $env:IMPERIO_SIGNING_KEY, "--exe", "`"$exe`"") -Wait -NoNewWindow -PassThru
+# Imperio.exe is a GUI-subsystem program: wait for it explicitly. The private
+# seed is read from IMPERIO_SIGNING_KEY (inherited), never put on the command
+# line where other processes could see it.
+$sign = Start-Process -FilePath $exe -ArgumentList @("release-sign", "`"$latest`"", "--exe", "`"$exe`"") -Wait -NoNewWindow -PassThru
 if ($sign.ExitCode -ne 0) { Write-Error "signing failed (exit $($sign.ExitCode))" }
 $signed = Get-Content $latest -Raw | ConvertFrom-Json
 if (-not $signed.sig) { Write-Error "latest.json was not signed" }

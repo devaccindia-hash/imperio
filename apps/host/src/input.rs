@@ -37,6 +37,10 @@ struct State {
     monitor: (i32, i32, i32, i32),
     /// Name of the desktop this thread last attached to.
     desktop: String,
+    /// Keys (scancode, extended) and mouse buttons the viewer currently holds
+    /// down, so they can be released if the session ends mid-press.
+    keys_down: Vec<(u16, bool)>,
+    buttons_down: Vec<MouseButton>,
 }
 
 /// Maps normalised stream coordinates onto the streamed display and injects.
@@ -47,7 +51,12 @@ pub struct Injector {
 impl Injector {
     pub fn new(left: i32, top: i32, width: i32, height: i32) -> Self {
         Self {
-            state: Mutex::new(State { monitor: (left, top, width, height), desktop: String::new() }),
+            state: Mutex::new(State {
+                monitor: (left, top, width, height),
+                desktop: String::new(),
+                keys_down: Vec::new(),
+                buttons_down: Vec::new(),
+            }),
         }
     }
 
@@ -88,8 +97,42 @@ impl Injector {
         ok
     }
 
+    /// Release every key and mouse button the viewer still holds down. Called
+    /// when a session ends, so a dropped connection cannot leave Ctrl, Alt or
+    /// a mouse button stuck on this computer.
+    pub fn release_all(&self) {
+        let (keys, buttons) = {
+            let mut st = self.state.lock().unwrap();
+            (std::mem::take(&mut st.keys_down), std::mem::take(&mut st.buttons_down))
+        };
+        for (scancode, extended) in keys {
+            self.inject(InputEvent::Key { scancode, extended, down: false, unicode: None });
+        }
+        for button in buttons {
+            self.inject(InputEvent::MouseButton { button, down: false });
+        }
+    }
+
     pub fn inject(&self, ev: InputEvent) {
-        let monitor = self.state.lock().unwrap().monitor;
+        let monitor = {
+            let mut st = self.state.lock().unwrap();
+            match ev {
+                InputEvent::Key { scancode, extended, down, .. } if scancode != 0 => {
+                    st.keys_down.retain(|k| *k != (scancode, extended));
+                    if down && st.keys_down.len() < 64 {
+                        st.keys_down.push((scancode, extended));
+                    }
+                }
+                InputEvent::MouseButton { button, down } => {
+                    st.buttons_down.retain(|b| *b != button);
+                    if down {
+                        st.buttons_down.push(button);
+                    }
+                }
+                _ => {}
+            }
+            st.monitor
+        };
         let input = match ev {
             InputEvent::MouseMove { nx, ny } => {
                 let (ml, mt, mw, mh) = monitor;

@@ -80,7 +80,7 @@ pub fn install(frame: &eframe::Frame) {
     // installed for the window's lifetime.
     unsafe {
         let icon = SendMessageW(hwnd, WM_GETICON, Some(WPARAM(ICON_SMALL as usize)), None);
-        let hicon = (icon.0 != 0).then(|| HICON(icon.0 as *mut _));
+        let hicon = (icon.0 != 0).then_some(HICON(icon.0 as *mut _));
         if SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0).as_bool() {
             TRAY.with(|t| {
                 *t.borrow_mut() = Some(ui::TrayIcon::add_with_icon(

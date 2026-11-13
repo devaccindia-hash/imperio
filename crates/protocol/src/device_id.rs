@@ -61,6 +61,12 @@ pub fn format(id: DeviceId) -> String {
 /// Parse a user-entered ID. Accepts any spacing/dashes, requires exactly 10
 /// digits, and rejects the input unless the Damm check digit is valid.
 pub fn parse(input: &str) -> Option<DeviceId> {
+    // Only digits with spaces or dashes between them are an ID. Anything else
+    // (the dots and colon of `192.168.1.20:7700`, a host name) is an address,
+    // even when its digits happen to add up to a valid check digit.
+    if !input.chars().all(|c| c.is_ascii_digit() || c == '-' || c.is_whitespace()) {
+        return None;
+    }
     let digits: Vec<u8> = input
         .chars()
         .filter(|c| c.is_ascii_digit())
@@ -85,6 +91,22 @@ pub fn parse(input: &str) -> Option<DeviceId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addresses_are_never_mistaken_for_ids() {
+        // Ten digits with a valid check digit, but written as an address.
+        assert_eq!(parse("127.0.0.1:7793"), None);
+        let id = format(123_456_789);
+        let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+        let as_ip = format!("{}.{}.{}.{}", &digits[0..3], &digits[3..6], &digits[6..8], &digits[8..10]);
+        assert_eq!(parse(&as_ip), None);
+        assert_eq!(parse(&format!("{}:{}", &digits[0..5], &digits[5..10])), None);
+        assert_eq!(parse("my-pc.local"), None);
+        // The same digits typed as an ID still work, with spaces or dashes.
+        assert_eq!(parse(&digits), Some(123_456_789));
+        assert_eq!(parse(&id.replace(' ', "-")), Some(123_456_789));
+        assert_eq!(parse(&format!("  {id}  ")), Some(123_456_789));
+    }
 
     #[test]
     fn format_parse_round_trip() {

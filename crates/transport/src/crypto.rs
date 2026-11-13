@@ -95,10 +95,15 @@ impl Cipher {
     }
 }
 
-/// Anti-replay window over nonce counters (RFC 6479 style, 1024 entries).
+/// Anti-replay window over nonce counters (RFC 6479 style, 4096 entries).
+///
+/// The window has to be wider than the number of datagrams sent while a NACK
+/// retransmission is still useful (a few hundred milliseconds): a retransmit
+/// reuses its original nonce, and one that has fallen out of the window is
+/// rejected as "too old". 4096 covers ~0.5 s at 100 Mbps.
 pub struct ReplayWindow {
     highest: u64,
-    bits: [u64; 16],
+    bits: [u64; Self::WORDS],
     seen_any: bool,
 }
 
@@ -106,14 +111,15 @@ impl Default for ReplayWindow {
     fn default() -> Self {
         Self {
             highest: 0,
-            bits: [0; 16],
+            bits: [0; Self::WORDS],
             seen_any: false,
         }
     }
 }
 
 impl ReplayWindow {
-    const SIZE: u64 = 1024;
+    const WORDS: usize = 64;
+    const SIZE: u64 = Self::WORDS as u64 * 64;
 
     /// Returns true if `n` is fresh and records it.
     pub fn check_and_set(&mut self, n: u64) -> bool {
@@ -126,7 +132,7 @@ impl ReplayWindow {
         if n > self.highest {
             let advance = n - self.highest;
             if advance >= Self::SIZE {
-                self.bits = [0; 16];
+                self.bits = [0; Self::WORDS];
             } else {
                 for i in 1..=advance {
                     self.clear(self.highest + i);
@@ -220,5 +226,9 @@ mod tests {
         assert!(w.check_and_set(5000));
         assert!(!w.check_and_set(10)); // too old now
         assert!(w.check_and_set(4999));
+        // A retransmit ~3000 datagrams late is still inside the window.
+        assert!(w.check_and_set(2000));
+        assert!(!w.check_and_set(2000));
+        assert!(!w.check_and_set(5000 - 4096));
     }
 }

@@ -36,8 +36,7 @@ impl BitrateController {
 
     /// Feed a report. Returns the new target when it changed by >= 5%.
     pub fn on_report(&mut self, r: &ReceiverReport, now: Instant) -> Option<u32> {
-        let prev = self.last_report.replace(*r);
-        let Some(prev) = prev else { return None };
+        let prev = self.last_report.replace(*r)?;
         let d_recv = r.received.saturating_sub(prev.received);
         let d_lost = r.lost.saturating_sub(prev.lost);
         let d_missing = r.missing_detected.saturating_sub(prev.missing_detected);

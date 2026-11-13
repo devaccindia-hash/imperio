@@ -10,9 +10,14 @@ use sha1::Sha1;
 
 const STEP: u64 = 30;
 const DIGITS: u32 = 6;
+/// Shortest accepted shared secret: 80 bits (a 16-character base32 secret,
+/// the shortest that authenticator apps commonly issue).
+const MIN_SECRET_BYTES: usize = 10;
 
 /// Decode a base32 (RFC 4648, no padding required) secret as used by
-/// authenticator apps.
+/// authenticator apps. Returns `None` for an empty or too-short secret,
+/// because an HMAC keyed with (almost) nothing would make every code
+/// predictable while looking like a working second factor.
 pub fn decode_base32(s: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut bits = 0u32;
@@ -28,7 +33,7 @@ pub fn decode_base32(s: &str) -> Option<Vec<u8>> {
             out.push((bits >> nbits) as u8);
         }
     }
-    Some(out)
+    (out.len() >= MIN_SECRET_BYTES).then_some(out)
 }
 
 fn hotp(secret: &[u8], counter: u64) -> u32 {
@@ -104,6 +109,11 @@ mod tests {
     #[test]
     fn base32_decodes() {
         // "JBSWY3DPEHPK3PXP" = "Hello!\xde\xad\xbe\xef"-ish; just check length/bytes.
-        assert_eq!(decode_base32("JBSWY3DP").unwrap(), b"Hello");
+        assert_eq!(decode_base32("JBSWY3DPEHPK3PXP").unwrap(), b"Hello!\xde\xad\xbe\xef");
+        assert_eq!(decode_base32("jbsw y3dp ehpk 3pxp").unwrap().len(), 10);
+        // Empty / too short / not base32: no second factor rather than a weak one.
+        assert!(decode_base32("").is_none());
+        assert!(decode_base32("JBSWY3DP").is_none());
+        assert!(decode_base32("not base32!").is_none());
     }
 }

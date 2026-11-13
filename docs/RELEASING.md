@@ -58,7 +58,12 @@ git commit -m "Release 0.4.0"; git push          # Pages redeploys site + manife
 
 ## Licence keys (Pro)
 
-    Imperio.exe license-sign --key <private seed> --name "Jane Doe" --plan pro --expires 2027-12-31
+    $env:IMPERIO_SIGNING_KEY = "<private seed>"
+    Imperio.exe license-sign --name "Jane Doe" --plan pro --expires 2027-12-31
+
+The seed is read from `IMPERIO_SIGNING_KEY` so it does not appear on a command
+line (where other programs and your shell history can see it). `--key <seed>`
+still works.
 
 Options: `--expires YYYY-MM-DD` (omit for perpetual), `--seats N`. Send the
 `IMP-…` key; the customer pastes it under **Sharing settings → Plan**. Keys are
@@ -66,7 +71,8 @@ verified offline; revocation is by expiry only.
 
 ## Checklist before a public release
 
-- `cargo test --workspace` green; one two-PC run.
+- `cargo clippy --workspace --all-targets` clean, `cargo test --workspace`
+  green, `bash tools/bench/run-e2e-tests.sh` all PASS; one two-PC run.
 - Version bumped; notes written for humans.
 - Authenticode certificate when available: sign `Imperio.exe` before
   `release.ps1` uploads it, so SmartScreen warnings fade.

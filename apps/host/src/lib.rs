@@ -19,7 +19,7 @@ mod ui;
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -38,7 +38,7 @@ use imperio_transport::identity::{self, DeviceKey};
 use imperio_transport::link::{Incoming, SecureLink};
 use imperio_transport::pacer::Pacer;
 use imperio_transport::rendezvous::{self, Path};
-use imperio_transport::{lan, now_us};
+use imperio_transport::{clip, lan, now_us};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
 
@@ -141,7 +141,12 @@ fn build_codec(cap: &Capturer, force: Option<&str>) -> anyhow::Result<(VideoDevi
     Ok((dev, FrameTransfer::Shared { cap_tex, enc_tex }, "same-adapter".into()))
 }
 
-/// Capture + encode for one display. Rebuilt when the viewer switches display.
+/// What one capture/encode step yields: the encoded frames, the capture
+/// timestamp, whether desktop updates were coalesced, and the capture wait.
+type Encoded = Option<(Vec<imperio_codec::EncodedFrame>, u64, bool, Duration)>;
+
+/// Capture + encode for one display. Rebuilt when the viewer switches display
+/// or the desktop duplication is lost (secure desktop, resolution change).
 struct Pipeline {
     cap: Capturer,
     width: u32,
@@ -227,9 +232,7 @@ impl Pipeline {
         }
     }
 
-    fn encode_last_as_keyframe(
-        &mut self,
-    ) -> anyhow::Result<Option<(Vec<imperio_codec::EncodedFrame>, u64, bool, Duration)>> {
+    fn encode_last_as_keyframe(&mut self) -> anyhow::Result<Encoded> {
         let Some(slot) = self.last_slot else {
             return Ok(None);
         };
@@ -238,11 +241,7 @@ impl Pipeline {
         Ok(Some((outputs, now_us(), false, Duration::ZERO)))
     }
 
-    fn capture_encode(
-        &mut self,
-        timeout: Duration,
-        force_key: bool,
-    ) -> anyhow::Result<Option<(Vec<imperio_codec::EncodedFrame>, u64, bool, Duration)>> {
+    fn capture_encode(&mut self, timeout: Duration, force_key: bool) -> anyhow::Result<Encoded> {
         let t_cap = Instant::now();
         let (captured_us, coalesced) = match self.cap.acquire(timeout) {
             Ok(frame) => {
@@ -264,12 +263,11 @@ impl Pipeline {
                 };
             }
             Err(CaptureError::AccessLost) => {
-                tracing::warn!("duplication lost (desktop switch?); recreating");
-                let old = std::mem::replace(&mut self.cap, Capturer::primary()?);
-                if let Ok(c) = old.recreate() {
-                    self.cap = c;
-                }
-                return Ok(None);
+                // The duplication is gone for good (secure desktop, display
+                // mode change, driver reset). The stream size and even the
+                // D3D device may differ afterwards, so the caller rebuilds
+                // the whole pipeline rather than patching this one.
+                anyhow::bail!("desktop duplication lost (desktop switch or display change)")
             }
             Err(e) => return Err(e.into()),
         };
@@ -361,6 +359,8 @@ fn publish(sink: &Option<StatusSink>, status: &HostStatus) {
 /// Command-line entry for the `imperio-host` binary and the `imperio host`
 /// subcommand. `raw` is the argument list without the program name.
 pub fn cli_main(raw: Vec<String>) -> anyhow::Result<()> {
+    // Before any window or screen measurement (see `init_dpi_per_monitor`).
+    imperio_ui::init_dpi_per_monitor();
 
     // Service management subcommands (first positional).
     match raw.first().map(String::as_str) {
@@ -389,7 +389,7 @@ pub fn cli_main(raw: Vec<String>) -> anyhow::Result<()> {
         .cloned();
     if raw.first().map(String::as_str) == Some("--firewall") {
         // Elevated helper launched by the home app's "Allow through firewall".
-        ensure_firewall(config::load_or_create().port);
+        ensure_firewall(config::load_or_create().port, true);
         return Ok(());
     }
     let mut cfg = config::load_or_create();
@@ -427,8 +427,9 @@ pub fn run_host(
     sink: Option<StatusSink>,
 ) -> anyhow::Result<()> {
     let HostOptions { force_relay, code_override, open } = opts;
+    imperio_ui::init_dpi_per_monitor();
     tracing::info!("imperio-host {} on udp/{}", env!("CARGO_PKG_VERSION"), cfg.port);
-    ensure_firewall(cfg.port);
+    ensure_firewall(cfg.port, false);
     imperio_codec::mf::startup()?;
     let mut status = HostStatus::default();
     let mut last_banner = String::new();
@@ -489,7 +490,7 @@ pub fn run_host(
         } else if unattended.is_some() {
             "Unattended password configured".to_string()
         } else {
-            format!("Code {} {}", &code[..3], &code[3..])
+            format!("Code {}", spaced_code(&code))
         };
         let shown_code = (!open && unattended.is_none()).then(|| code.clone());
         let addresses: Vec<String> = match &server {
@@ -541,7 +542,26 @@ pub fn run_host(
 
         let (session, path, first_handshake) = match server {
             Some(server) => {
-                let (session, path) = rendezvous::host_wait_for_viewer(&socket, server, device_id, &device_key, force_relay)?;
+                // Let the outer loop act on pause / stop / new-code requests.
+                let cancel = || {
+                    !controls.accepting.load(Ordering::Relaxed)
+                        || controls.regen_code.load(Ordering::Relaxed)
+                        || controls.stop.load(Ordering::Relaxed)
+                };
+                let found = rendezvous::host_wait_for_viewer(&socket, server, device_id, &device_key, force_relay, &cancel);
+                let (session, path) = match found {
+                    Ok(Some(x)) => x,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        // One viewer's failed hole punch (or a server hiccup)
+                        // must not end sharing for everyone after it.
+                        tracing::warn!(error = format_args!("{e:#}"), "rendezvous failed; retrying");
+                        status.status = format!("Signal server problem: {e:#}");
+                        publish(&sink, &status);
+                        std::thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
+                };
                 let hs = wait_handshake(&socket, Some(path.addr()), Duration::from_secs(5))?;
                 (session, path, hs)
             }
@@ -573,6 +593,13 @@ pub fn run_host(
             continue;
         };
         if first_handshake.session != session {
+            continue;
+        }
+        // Open mode has no secret, so the network is the only gate: whatever
+        // way the peer was found (direct, signal server, relay), it must be a
+        // tailnet or loopback address. A relayed or internet peer is refused.
+        if open && !is_tailnet_or_local(path.addr().ip()) {
+            tracing::warn!(peer = %path.addr(), "refused non-Tailscale connection (open mode)");
             continue;
         }
 
@@ -638,36 +665,66 @@ fn is_tailnet_or_local(ip: std::net::IpAddr) -> bool {
     })
 }
 
+/// "123 456" for the usual six-digit code; anything else (a fixed `--code`)
+/// is shown as it is.
+fn spaced_code(code: &str) -> String {
+    if code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_string()
+    }
+}
+
+/// Run `netsh` from the Windows system directory (never from the current
+/// directory or PATH, where a planted `netsh.exe` could be picked up — this
+/// also runs elevated) and without flashing a console window.
+fn netsh(args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    std::process::Command::new(root.join("System32").join("netsh.exe"))
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+}
+
 /// Open an inbound Windows Firewall rule for the host's UDP port, so viewers
-/// on the network can reach it. Succeeds when the process is elevated (the
-/// launcher runs the host as administrator); otherwise it prints a clear hint.
-fn ensure_firewall(port: u16) {
-    use std::process::Command;
-    let name = "Imperio Host";
+/// on the network can reach it. Adding a rule needs administrator rights; an
+/// existing rule for this port is left alone unless `force` is set (the
+/// elevated "Allow through firewall" helper).
+fn ensure_firewall(port: u16, force: bool) {
+    const NAME: &str = "name=Imperio Host";
+    let port_arg = format!("localport={port}");
+    if !force {
+        if let Ok(o) = netsh(&["advfirewall", "firewall", "show", "rule", NAME]) {
+            // The port number is the one part of the listing that is not
+            // translated, so this works on every display language.
+            if o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&port.to_string()) {
+                return;
+            }
+        }
+    }
     // Remove any previous rule so re-runs don't stack duplicates.
-    let _ = Command::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={name}")])
-        .output();
-    let out = Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={name}"),
-            "dir=in",
-            "action=allow",
-            "protocol=UDP",
-            &format!("localport={port}"),
-        ])
-        .output();
+    let _ = netsh(&["advfirewall", "firewall", "delete", "rule", NAME]);
+    let out = netsh(&[
+        "advfirewall",
+        "firewall",
+        "add",
+        "rule",
+        NAME,
+        "dir=in",
+        "action=allow",
+        "protocol=UDP",
+        &port_arg,
+    ]);
     match out {
         Ok(o) if o.status.success() => tracing::info!(port, "firewall opened for inbound UDP"),
-        _ => {
-            println!("  (!) Could not open the firewall automatically. If the viewer cannot");
-            println!("      connect, right-click 1-START-HOST.bat and choose 'Run as");
-            println!("      administrator', or allow imperio-host.exe in your antivirus.");
-        }
+        _ => tracing::info!(
+            port,
+            "no firewall rule yet (needs administrator rights): use \"Allow through firewall\" if other computers cannot connect"
+        ),
     }
 }
 
@@ -748,18 +805,27 @@ enum SessionEnd {
 
 enum Event {
     Hello,
+    /// The viewer speaks a different protocol version.
+    Incompatible(u16),
     Totp(bool),
     KeyframeRequest,
     SelectMonitor(u8),
     Bye,
 }
 
+/// Tell the viewer why it is being turned away, then close. Best effort: the
+/// viewer shows the reason instead of a window that never fills in.
+fn deny(link: &SecureLink, reason: &str) {
+    let _ = link.send_control(&ControlMessage::Denied(reason.to_string()));
+    let _ = link.send_control(&ControlMessage::Bye);
+}
+
 fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) -> anyhow::Result<SessionEnd> {
     let cfg = ctx.cfg;
     // Create the injector from a cheap monitor-rect lookup and start the
     // receive thread *before* the slow encoder/pipeline build, so Ping/Pong
-    // (hence the RTT estimate) and input stay responsive from the first
-    // moment instead of being answered only after the GPU encoder is ready.
+    // (hence the RTT estimate) stays responsive from the first moment instead
+    // of being answered only after the GPU encoder is ready.
     let mons = Capturer::monitors();
     let rect0 = mons
         .get(cfg.monitor as usize)
@@ -774,24 +840,22 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
     ));
 
     let running = Arc::new(AtomicBool::new(true));
+    // The gate. Holding the session keys only proves the peer knew the code.
+    // Until the second factor and the local "Yes" (when configured) have also
+    // passed, nothing the peer sends may act on this computer: otherwise it
+    // could type into the consent dialog that is asking about it.
+    let authorized = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Event>();
     let target_kbps = Arc::new(AtomicU32::new(cfg.bitrate_kbps));
     let last_feedback_us = Arc::new(AtomicU64::new(now_us()));
-
-    // Clipboard: host -> viewer on local change.
-    let clipboard = if cfg.clipboard {
-        let link = link.clone();
-        Some(Arc::new(ClipboardSync::spawn(MAX_CLIPBOARD_BYTES, move |text| {
-            let _ = link.send_control(&ControlMessage::Clipboard(text));
-        })))
-    } else {
-        None
-    };
+    // Clipboard sync starts only once the session is authorized (see below).
+    let clipboard: Arc<OnceLock<ClipboardSync>> = Arc::new(OnceLock::new());
 
     let rx_thread = {
         let link = link.clone();
         let socket = socket.clone();
         let running = running.clone();
+        let authorized = authorized.clone();
         let injector = injector.clone();
         let target_kbps = target_kbps.clone();
         let last_feedback_us = last_feedback_us.clone();
@@ -801,6 +865,7 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
         std::thread::Builder::new().name("session-rx".into()).spawn(move || {
             socket.set_read_timeout(Some(Duration::from_millis(50))).ok();
             let mut buf = vec![0u8; 2048];
+            let mut clip_in = clip::Reassembler::default();
             let mut last_desktop_check = Instant::now() - Duration::from_secs(1);
             // Attach to the active input desktop up front.
             injector.follow_input_desktop();
@@ -818,16 +883,17 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                 match link.handle_datagram(&buf[..n], now) {
                     Some(Incoming::Control(msg)) => {
                         last_feedback_us.store(now_us(), Ordering::Relaxed);
+                        let authed = authorized.load(Ordering::Acquire);
                         match msg {
+                            // --- allowed before authorization: the handshake
+                            // itself and liveness. None of these touch the PC.
                             ControlMessage::Hello { version } => {
                                 if version == PROTOCOL_VERSION {
                                     let _ = tx.send(Event::Hello);
                                 } else {
                                     tracing::warn!(version, "viewer protocol mismatch");
+                                    let _ = tx.send(Event::Incompatible(version));
                                 }
-                            }
-                            ControlMessage::RequestKeyframe => {
-                                let _ = tx.send(Event::KeyframeRequest);
                             }
                             ControlMessage::Totp(code) => {
                                 let ok = totp_secret
@@ -837,21 +903,33 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                                     .unwrap_or(true);
                                 let _ = tx.send(Event::Totp(ok));
                             }
-                            ControlMessage::SelectMonitor(n) => {
-                                let _ = tx.send(Event::SelectMonitor(n));
-                            }
-                            ControlMessage::Clipboard(text) => {
-                                if let Some(cb) = &clipboard {
-                                    cb.apply_remote(text);
-                                }
-                            }
-                            ControlMessage::Input(ev) => injector.inject(ev),
                             ControlMessage::Ping { t_us } => {
                                 let _ = link.send_control(&ControlMessage::Pong { t_us });
                             }
                             ControlMessage::Bye => {
                                 let _ = tx.send(Event::Bye);
                             }
+                            // --- everything below acts on this computer.
+                            _ if !authed => {
+                                tracing::debug!("ignored a control message sent before authorization")
+                            }
+                            ControlMessage::RequestKeyframe => {
+                                let _ = tx.send(Event::KeyframeRequest);
+                            }
+                            ControlMessage::SelectMonitor(n) => {
+                                let _ = tx.send(Event::SelectMonitor(n));
+                            }
+                            ControlMessage::Clipboard(text) => {
+                                if let Some(cb) = clipboard.get() {
+                                    cb.apply_remote(text);
+                                }
+                            }
+                            ControlMessage::ClipboardChunk { id, index, count, data } => {
+                                if let (Some(cb), Some(text)) = (clipboard.get(), clip_in.push(id, index, count, data)) {
+                                    cb.apply_remote(text);
+                                }
+                            }
+                            ControlMessage::Input(ev) => injector.inject(ev),
                             other => tracing::debug!(?other, "unexpected control message"),
                         }
                     }
@@ -864,15 +942,18 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                     _ => {}
                 }
             }
+            // Never leave a key or mouse button held down on this computer
+            // because the viewer vanished mid-press.
+            injector.release_all();
         })?
     };
 
     let result = (|| -> anyhow::Result<SessionEnd> {
         // Gate: authenticated Hello, then optional TOTP, then optional consent.
-        match authenticate(&rx, ctx.totp_secret.is_some(), ctx.ask_first, link.peer()) {
-            Ok(()) => {}
-            Err(end) => return Ok(end),
+        if let Err(end) = authenticate(&rx, &link, ctx.totp_secret.is_some(), ctx.ask_first) {
+            return Ok(end);
         }
+        authorized.store(true, Ordering::Release);
         // Prove device identity so the viewer can pin it (TOFU).
         let sig = ctx.device_key.sign_session(link.session_keys());
         link.send_control(&ControlMessage::Identity {
@@ -881,8 +962,18 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
             sig: sig.to_vec(),
         })?;
 
+        // Clipboard: host -> viewer on local change. Started only now, so
+        // nothing copied on this computer reaches a peer that was refused.
+        if cfg.clipboard {
+            let link = link.clone();
+            let next_id = AtomicU32::new(1);
+            let _ = clipboard.set(ClipboardSync::spawn(MAX_CLIPBOARD_BYTES, move |text| {
+                clip::send(&link, next_id.fetch_add(1, Ordering::Relaxed), text);
+            }));
+        }
+
         // Build the capture + encode pipeline now that the peer is trusted.
-        let mut pipeline = Pipeline::for_monitor(cfg, cfg.monitor)?;
+        let pipeline = Pipeline::for_monitor(cfg, cfg.monitor)?;
         injector.set_monitor(
             pipeline.rect.left,
             pipeline.rect.top,
@@ -924,38 +1015,66 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                 })
                 .ok();
         }
-        stream_loop(cfg, &mut pipeline, &injector, &link, &rx, &target_kbps, &last_feedback_us)
+        stream_loop(cfg, pipeline, &injector, &link, &rx, &target_kbps, &last_feedback_us)
     })();
 
+    authorized.store(false, Ordering::Release);
+    // Let the viewer close (with a reason, if there is one) rather than sit
+    // in front of a frozen picture.
+    match &result {
+        Ok(SessionEnd::Bye) => {}
+        Ok(_) => {
+            let _ = link.send_control(&ControlMessage::Bye);
+        }
+        Err(e) => deny(&link, &format!("The other computer could not share its screen ({e:#}).")),
+    }
     running.store(false, Ordering::Relaxed);
     let _ = rx_thread.join();
     result
 }
 
 /// Wait for the authenticated Hello, then (if required) a valid TOTP, then (if
-/// configured) local consent. Returns `Err(end)` to abort the session.
+/// configured) local consent. Returns `Err(end)` to abort the session; the
+/// viewer has been told why by then.
 fn authenticate(
     rx: &mpsc::Receiver<Event>,
+    link: &SecureLink,
     totp_required: bool,
     require_accept: bool,
-    peer: SocketAddr,
 ) -> Result<(), SessionEnd> {
+    let peer = link.peer();
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut hello = false;
     let mut totp_ok = !totp_required;
     while !(hello && totp_ok) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Event::Hello) => hello = true,
+            Ok(Event::Incompatible(version)) => {
+                deny(
+                    link,
+                    &format!(
+                        "The two computers run different Imperio versions (protocol {version} here, {PROTOCOL_VERSION} there). Update Imperio on both."
+                    ),
+                );
+                // Not a guessing attempt: the peer did know the code.
+                return Err(SessionEnd::Bye);
+            }
             Ok(Event::Totp(ok)) => {
                 if !ok {
                     tracing::warn!(%peer, "second factor (TOTP) rejected");
+                    deny(link, "The two-step code was wrong or has expired.");
                     return Err(SessionEnd::Rejected);
                 }
                 totp_ok = true;
             }
             Ok(Event::Bye) => return Err(SessionEnd::Bye),
             Ok(_) => {}
-            Err(_) if Instant::now() > deadline => return Err(SessionEnd::NoHello),
+            Err(_) if Instant::now() > deadline => {
+                if hello {
+                    deny(link, "That computer also asks for a two-step (authenticator) code.");
+                }
+                return Err(SessionEnd::NoHello);
+            }
             Err(_) => {}
         }
     }
@@ -968,15 +1087,20 @@ fn authenticate(
     tracing::warn!(%peer, "remote session starting");
     if require_accept && !consent::ask(peer) {
         tracing::warn!(%peer, "remote session refused by local user");
+        deny(link, "The person at the other computer declined the connection.");
         return Err(SessionEnd::Rejected);
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// How long a session waits for the screen to become capturable again (an
+/// elevation prompt or lock screen that this process may not capture, a
+/// display being reconfigured) before giving up.
+const RECAPTURE_GIVE_UP: Duration = Duration::from_secs(120);
+
 fn stream_loop(
     cfg: &Config,
-    pipeline: &mut Pipeline,
+    first: Pipeline,
     injector: &Arc<input::Injector>,
     link: &Arc<SecureLink>,
     rx: &mpsc::Receiver<Event>,
@@ -984,7 +1108,14 @@ fn stream_loop(
     last_feedback_us: &Arc<AtomicU64>,
 ) -> anyhow::Result<SessionEnd> {
     tracing::info!("viewer authenticated; streaming");
-    link.send_control(&pipeline.stream_info())?;
+    link.send_control(&first.stream_info())?;
+
+    // `None` while the pipeline is being rebuilt (display switch, or the
+    // desktop duplication was lost). The old one is dropped *before* a new
+    // one is created so the two never hold the same display at once.
+    let mut monitor = first.monitor_index;
+    let mut slot = Some(first);
+    let mut lost_since: Option<Instant> = None;
 
     let mut force_key = true;
     let mut frame_id = 0u32;
@@ -998,28 +1129,17 @@ fn stream_loop(
             match ev {
                 Event::KeyframeRequest => force_key = true,
                 Event::Bye => return Ok(SessionEnd::Bye),
-                Event::Totp(_) => {}
+                Event::Totp(_) | Event::Incompatible(_) => {}
                 Event::Hello => {
                     force_key = true;
-                    link.send_control(&pipeline.stream_info())?;
+                    if let Some(p) = &slot {
+                        link.send_control(&p.stream_info())?;
+                    }
                 }
                 Event::SelectMonitor(n) => {
-                    if n != pipeline.monitor_index {
-                        match Pipeline::for_monitor(cfg, n) {
-                            Ok(p) => {
-                                *pipeline = p;
-                                injector.set_monitor(
-                                    pipeline.rect.left,
-                                    pipeline.rect.top,
-                                    pipeline.rect.right - pipeline.rect.left,
-                                    pipeline.rect.bottom - pipeline.rect.top,
-                                );
-                                force_key = true;
-                                link.send_control(&pipeline.stream_info())?;
-                                tracing::info!(monitor = pipeline.monitor_index, "switched display");
-                            }
-                            Err(e) => tracing::warn!(error = %e, "display switch failed"),
-                        }
+                    if n != monitor {
+                        monitor = n;
+                        slot = None;
                     }
                 }
             }
@@ -1027,15 +1147,56 @@ fn stream_loop(
         if now_us().saturating_sub(last_feedback_us.load(Ordering::Relaxed)) > 5_000_000 {
             return Ok(SessionEnd::Timeout);
         }
-        let want = target_kbps.load(Ordering::Relaxed);
-        if want != current_kbps {
-            if p_set_bitrate(pipeline, want) {
-                current_kbps = want;
-                pacer.set_target(want, 25_000);
+
+        let Some(pipeline) = slot.as_mut() else {
+            match Pipeline::for_monitor(cfg, monitor) {
+                Ok(p) => {
+                    monitor = p.monitor_index;
+                    injector.set_monitor(
+                        p.rect.left,
+                        p.rect.top,
+                        p.rect.right - p.rect.left,
+                        p.rect.bottom - p.rect.top,
+                    );
+                    link.send_control(&p.stream_info())?;
+                    tracing::info!(monitor, "capture pipeline (re)built");
+                    // A fresh encoder starts at the configured bitrate; the
+                    // adaptive target is re-applied on the next pass.
+                    current_kbps = cfg.bitrate_kbps;
+                    pacer.set_target(current_kbps, 25_000);
+                    force_key = true;
+                    slot = Some(p);
+                }
+                Err(e) => {
+                    let since = *lost_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > RECAPTURE_GIVE_UP {
+                        return Err(e.context("the screen could not be captured"));
+                    }
+                    tracing::debug!(error = format_args!("{e:#}"), "screen not capturable yet; retrying");
+                    std::thread::sleep(Duration::from_millis(250));
+                }
             }
+            continue;
+        };
+
+        let want = target_kbps.load(Ordering::Relaxed);
+        if want != current_kbps && p_set_bitrate(pipeline, want) {
+            current_kbps = want;
+            pacer.set_target(want, 25_000);
         }
 
-        let Some((outputs, captured_us, coalesced, cap_wait)) = pipeline.capture_encode(frame_timeout, force_key)? else {
+        let step = match pipeline.capture_encode(frame_timeout, force_key) {
+            Ok(step) => step,
+            Err(e) => {
+                tracing::warn!(error = format_args!("{e:#}"), "capture pipeline failed; rebuilding");
+                lost_since.get_or_insert_with(Instant::now);
+                slot = None;
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        lost_since = None;
+        let Some((outputs, captured_us, coalesced, cap_wait)) = step else {
             continue;
         };
         force_key = false;
