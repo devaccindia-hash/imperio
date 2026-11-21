@@ -1,7 +1,7 @@
 {
-  "version": "0.3.14",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.14/Imperio.exe",
-  "sha256": "924acedbdd351de30da1328048c06ae85a23fdd13110338d68f1d1ee8183ff2e",
-  "notes": "Only one Imperio runs at a time: starting it closes any other copy that was left open.",
-  "sig": "G6rOdqrya-Kr9ONVMqLDLA6GmiLckPJptWkxiE8joQqNNQ1gR41nlSAbmnrf9Q6aKXsyNRi7CuyW92l5AuUaDg"
+  "version": "0.3.15",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.15/Imperio.exe",
+  "sha256": "938815f8dd53b1aadda5ab05716a8128482863d311645c1077d82712d4f7297b",
+  "notes": "Much smoother, faster sessions: fixed a delay that made the remote screen feel laggy and choppy. Update both computers.",
+  "sig": "GbWYDH7NCrubB8eYSum0GkeCebwlgU5hckACnEMoN8wOwh99T17TiVOMXw71ND7XXzF9D6fhzkAUbjHOxJ8EDw"
 }
