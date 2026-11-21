@@ -141,9 +141,19 @@ fn build_codec(cap: &Capturer, force: Option<&str>) -> anyhow::Result<(VideoDevi
     Ok((dev, FrameTransfer::Shared { cap_tex, enc_tex }, "same-adapter".into()))
 }
 
-/// What one capture/encode step yields: the encoded frames, the capture
-/// timestamp, whether desktop updates were coalesced, and the capture wait.
-type Encoded = Option<(Vec<imperio_codec::EncodedFrame>, u64, bool, Duration)>;
+/// What one capture/encode step yields: the encoded frames, each with the
+/// time its own picture was captured, whether desktop updates were
+/// coalesced, and the capture wait.
+type Encoded = Option<(Vec<(imperio_codec::EncodedFrame, u64)>, bool, Duration, StageTimes)>;
+
+/// Time spent in each step between the screen changing and the encoder
+/// being handed the picture (shown in the periodic `stream` log line).
+#[derive(Default, Clone, Copy)]
+struct StageTimes {
+    cursor: Duration,
+    upload: Duration,
+    convert: Duration,
+}
 
 /// Capture + encode for one display. Rebuilt when the viewer switches display
 /// or the desktop duplication is lost (secure desktop, resolution change).
@@ -162,6 +172,9 @@ struct Pipeline {
     encoder: MfH264Encoder,
     cursor: Option<cursor::CursorPainter>,
     start: Instant,
+    /// Pictures handed to the encoder and not yet returned: (encoder time
+    /// stamp, capture wall-clock time).
+    in_encoder: std::collections::VecDeque<(i64, u64)>,
 }
 
 impl Pipeline {
@@ -216,6 +229,7 @@ impl Pipeline {
             ring,
             ring_i: 0,
             last_slot: None,
+            in_encoder: Default::default(),
             encoder,
             cursor,
             start: Instant::now(),
@@ -232,35 +246,65 @@ impl Pipeline {
         }
     }
 
+    /// Pair each encoded frame with the capture time of its own picture.
+    fn stamp(&mut self, outputs: Vec<imperio_codec::EncodedFrame>) -> Vec<(imperio_codec::EncodedFrame, u64)> {
+        outputs
+            .into_iter()
+            .map(|out| {
+                let mut captured = now_us();
+                while let Some(&(pts, us)) = self.in_encoder.front() {
+                    if pts > out.pts_100ns {
+                        break;
+                    }
+                    captured = us;
+                    self.in_encoder.pop_front();
+                }
+                (out, captured)
+            })
+            .collect()
+    }
+
     fn encode_last_as_keyframe(&mut self) -> anyhow::Result<Encoded> {
         let Some(slot) = self.last_slot else {
             return Ok(None);
         };
         let pts = self.start.elapsed().as_nanos() as i64 / 100;
+        self.in_encoder.push_back((pts, now_us()));
         let outputs = self.encoder.encode(&self.ring[slot], pts, true)?;
-        Ok(Some((outputs, now_us(), false, Duration::ZERO)))
+        Ok(Some((self.stamp(outputs), false, Duration::ZERO, StageTimes::default())))
     }
 
     fn capture_encode(&mut self, timeout: Duration, force_key: bool) -> anyhow::Result<Encoded> {
         let t_cap = Instant::now();
+        let mut stages = StageTimes::default();
         let (captured_us, coalesced) = match self.cap.acquire(timeout) {
             Ok(frame) => {
                 let us = now_us();
                 let coalesced = frame.accumulated_frames() > 1;
                 // Optionally draw the cursor, then publish to the encoder device.
+                let t = Instant::now();
                 let src = match &self.cursor {
                     Some(painter) => painter.paint(frame.texture(), self.rect),
                     None => frame.texture(),
                 };
+                stages.cursor = t.elapsed();
+                let t = Instant::now();
                 self.transfer.upload(frame.device_context(), src)?;
+                stages.upload = t.elapsed();
                 (us, coalesced)
             }
             Err(CaptureError::Timeout) => {
-                return if force_key {
-                    self.encode_last_as_keyframe()
+                if force_key {
+                    return self.encode_last_as_keyframe();
+                }
+                // Nothing changed on screen: hand over anything the encoder
+                // finished late, so no picture waits for the next change.
+                let late = self.encoder.poll()?;
+                return Ok(if late.is_empty() {
+                    None
                 } else {
-                    Ok(None)
-                };
+                    Some((self.stamp(late), false, Duration::ZERO, StageTimes::default()))
+                });
             }
             Err(CaptureError::AccessLost) => {
                 // The duplication is gone for good (secure desktop, display
@@ -271,18 +315,25 @@ impl Pipeline {
             }
             Err(e) => return Err(e.into()),
         };
-        let cap_wait = t_cap.elapsed();
+        let cap_wait = t_cap.elapsed().saturating_sub(stages.cursor + stages.upload);
         let slot = self.ring_i;
         let nv12 = &self.ring[slot];
         self.ring_i = (self.ring_i + 1) % self.ring.len();
         self.last_slot = Some(slot);
+        let t = Instant::now();
         let input = self.transfer.acquire_input()?;
         let conv = self.converter.convert(input, 0, nv12);
         self.transfer.release_input()?;
         conv?;
+        stages.convert = t.elapsed();
         let pts = self.start.elapsed().as_nanos() as i64 / 100;
+        self.in_encoder.push_back((pts, captured_us));
+        // The queue only grows if an encoder swallows pictures; keep it small.
+        while self.in_encoder.len() > 64 {
+            self.in_encoder.pop_front();
+        }
         let outputs = self.encoder.encode(nv12, pts, force_key)?;
-        Ok(Some((outputs, captured_us, coalesced, cap_wait)))
+        Ok(Some((self.stamp(outputs), coalesced, cap_wait, stages)))
     }
 }
 
@@ -1212,13 +1263,14 @@ fn stream_loop(
             }
         };
         lost_since = None;
-        let Some((outputs, captured_us, coalesced, cap_wait)) = step else {
+        let Some((outputs, coalesced, cap_wait, stages)) = step else {
             continue;
         };
         force_key = false;
         stats.coalesced += coalesced as u64;
-        for out in outputs {
+        for (out, captured_us) in outputs {
             frame_id = frame_id.wrapping_add(1);
+            let t_send = Instant::now();
             for c in lan::split(frame_id, out.keyframe, captured_us, &out.data) {
                 pacer.wait_for(c.len() + 40);
                 link.send_media(&c, now_us())?;
@@ -1226,6 +1278,7 @@ fn stream_loop(
             link.send_media(&[], now_us())?;
             link.send_media(&[], now_us())?;
             stats.record(cap_wait, out.encode_time, out.data.len(), out.keyframe);
+            stats.stage(stages, t_send.elapsed());
         }
         stats.maybe_report(link, current_kbps);
     }
@@ -1253,6 +1306,14 @@ struct Stats {
     cap_total: Duration,
     enc_total: Duration,
     enc_max: Duration,
+    cursor_total: Duration,
+    upload_total: Duration,
+    convert_total: Duration,
+    send_total: Duration,
+    send_max: Duration,
+    /// Longest pause between two frames leaving, and when the last one left.
+    gap_max: Duration,
+    last_frame: Option<Instant>,
     last: Option<Instant>,
 }
 
@@ -1264,6 +1325,19 @@ impl Stats {
         self.cap_total += cap;
         self.enc_total += enc;
         self.enc_max = self.enc_max.max(enc);
+    }
+
+    fn stage(&mut self, s: StageTimes, send: Duration) {
+        self.cursor_total += s.cursor;
+        self.upload_total += s.upload;
+        self.convert_total += s.convert;
+        self.send_total += send;
+        self.send_max = self.send_max.max(send);
+        let now = Instant::now();
+        if let Some(prev) = self.last_frame {
+            self.gap_max = self.gap_max.max(now.duration_since(prev));
+        }
+        self.last_frame = Some(now);
     }
 
     fn maybe_report(&mut self, link: &SecureLink, kbps: u32) {
@@ -1281,10 +1355,17 @@ impl Stats {
                 target_kbps = kbps,
                 keyframes = self.keyframes,
                 enc_ms = format_args!("{:.2}", self.enc_total.as_secs_f64() * 1e3 / self.frames as f64),
+                enc_max_ms = format_args!("{:.1}", self.enc_max.as_secs_f64() * 1e3),
+                cursor_ms = format_args!("{:.2}", self.cursor_total.as_secs_f64() * 1e3 / self.frames as f64),
+                upload_ms = format_args!("{:.2}", self.upload_total.as_secs_f64() * 1e3 / self.frames as f64),
+                convert_ms = format_args!("{:.2}", self.convert_total.as_secs_f64() * 1e3 / self.frames as f64),
+                send_ms = format_args!("{:.2}", self.send_total.as_secs_f64() * 1e3 / self.frames as f64),
+                send_max_ms = format_args!("{:.1}", self.send_max.as_secs_f64() * 1e3),
+                longest_gap_ms = format_args!("{:.0}", self.gap_max.as_secs_f64() * 1e3),
                 retransmits = s.retransmits,
                 "stream"
             );
         }
-        *self = Stats { last: Some(now), ..Default::default() };
+        *self = Stats { last: Some(now), last_frame: self.last_frame, ..Default::default() };
     }
 }

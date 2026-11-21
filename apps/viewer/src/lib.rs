@@ -129,6 +129,10 @@ struct App {
     ctrl: bool,
     shift: bool,
     cursor: Option<(f64, f64)>,
+    /// Largest gap between the picture fed to the decoder and the one it
+    /// returned, and inputs that returned nothing, since the last report.
+    hold_max_100ns: i64,
+    held_back: u32,
     frames: u64,
     latency_sum_us: u64,
     last_title: Instant,
@@ -255,7 +259,13 @@ impl App {
         let t0 = Instant::now();
         let decoded = dec.decode(&f.data, pts)?;
         let dec_ms = t0.elapsed();
+        if decoded.is_empty() {
+            self.held_back += 1;
+        }
         for d in decoded {
+            // A decoder that hands back an older picture than the one just
+            // fed in is holding frames: every held frame is added delay.
+            self.hold_max_100ns = self.hold_max_100ns.max(pts - d.pts_100ns);
             r.present(&d.texture, d.subresource)?;
             self.frames += 1;
             // Only meaningful when host and viewer share a clock.
@@ -275,11 +285,15 @@ impl App {
                     rtt_ms = format_args!("{rtt:.1}"),
                     decode_ms = format_args!("{dec:.2}"),
                     capture_to_present_ms = format_args!("{g2g:.1}"),
+                    decoder_hold_ms = format_args!("{:.1}", self.hold_max_100ns as f64 / 1e4),
+                    no_output = self.held_back,
                     "viewer"
                 );
             }
             self.frames = 0;
             self.latency_sum_us = 0;
+            self.hold_max_100ns = 0;
+            self.held_back = 0;
             self.last_title = Instant::now();
         }
         Ok(())
@@ -511,6 +525,7 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
             socket.set_nonblocking(true).ok();
             let mut buf = vec![0u8; 2048];
             let mut assembler = FrameAssembler::default();
+            let mut timing = Timing::default();
             // Play the host's audio. Failure (no device, etc.) just means a
             // silent session, never a dead video stream.
             let audio_out = match imperio_audio::playback::AudioPlayback::start() {
@@ -542,8 +557,9 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                                 last_heard = now;
                             }
                             match incoming {
-                                Some(Incoming::Media { payload, .. }) => {
+                                Some(Incoming::Media { payload, send_ts_us, .. }) => {
                                     if let Some((h, p)) = lan::parse(payload) {
+                                        timing.chunk(&h, send_ts_us, now_us());
                                         assembler.push(h, p, now);
                                     }
                                 }
@@ -700,6 +716,7 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                         deadline_ms = assembler.deadline().as_millis(),
                         "link"
                     );
+                    timing.report();
                     last_stats = now;
                 }
             }
@@ -862,6 +879,78 @@ fn diagnose(host: std::net::SocketAddr) -> String {
         );
     }
     msg
+}
+
+/// Where a frame's time goes, measured from the viewer alone.
+///
+/// Every chunk carries two host-clock stamps: when its frame was captured and
+/// when the chunk was sent. Their difference is the time the frame spent
+/// inside the host (cursor, colour conversion, encoder and any frames the
+/// encoder holds back) and needs no clock agreement between the computers.
+/// Network time is the arrival time minus the send stamp, less the smallest
+/// such difference seen (which absorbs the clock offset).
+#[derive(Default)]
+struct Timing {
+    frame: Option<u32>,
+    frame_host_us: u64,
+    last_capture_us: u64,
+    offset_min: Option<i64>,
+    frames: u64,
+    host_sum_us: u64,
+    host_max_us: u64,
+    net_sum_us: u64,
+    net_max_us: u64,
+    chunks: u64,
+    gap_max_us: u64,
+}
+
+impl Timing {
+    fn chunk(&mut self, h: &lan::ChunkHeader, send_ts_us: u64, now_us: u64) {
+        if self.frame != Some(h.frame_id) {
+            self.close_frame();
+            self.frame = Some(h.frame_id);
+            if self.last_capture_us != 0 {
+                self.gap_max_us = self.gap_max_us.max(h.timestamp_us.saturating_sub(self.last_capture_us));
+            }
+            self.last_capture_us = h.timestamp_us;
+        }
+        self.frame_host_us = self.frame_host_us.max(send_ts_us.saturating_sub(h.timestamp_us));
+        let d = now_us as i64 - send_ts_us as i64;
+        let off = *self.offset_min.get_or_insert(d);
+        if d < off {
+            self.offset_min = Some(d);
+        }
+        let net = (d - self.offset_min.unwrap_or(d)).max(0) as u64;
+        self.net_sum_us += net;
+        self.net_max_us = self.net_max_us.max(net);
+        self.chunks += 1;
+    }
+
+    fn close_frame(&mut self) {
+        if self.frame.take().is_some() {
+            self.frames += 1;
+            self.host_sum_us += self.frame_host_us;
+            self.host_max_us = self.host_max_us.max(self.frame_host_us);
+            self.frame_host_us = 0;
+        }
+    }
+
+    fn report(&mut self) {
+        if self.frames > 0 && self.chunks > 0 {
+            tracing::info!(
+                frames = self.frames,
+                host_ms = format_args!("{:.1}", self.host_sum_us as f64 / self.frames as f64 / 1e3),
+                host_max_ms = format_args!("{:.1}", self.host_max_us as f64 / 1e3),
+                net_jitter_ms = format_args!("{:.1}", self.net_sum_us as f64 / self.chunks as f64 / 1e3),
+                net_jitter_max_ms = format_args!("{:.1}", self.net_max_us as f64 / 1e3),
+                longest_gap_ms = format_args!("{:.1}", self.gap_max_us as f64 / 1e3),
+                "timing"
+            );
+        }
+        let (frame, frame_host_us, last_capture_us, offset_min) =
+            (self.frame, self.frame_host_us, self.last_capture_us, self.offset_min);
+        *self = Timing { frame, frame_host_us, last_capture_us, offset_min, ..Default::default() };
+    }
 }
 
 /// Everything needed to open one remote session.
@@ -1033,6 +1122,8 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
         ctrl: false,
         shift: false,
         cursor: None,
+        hold_max_100ns: 0,
+        held_back: 0,
         frames: 0,
         latency_sum_us: 0,
         last_title: Instant::now(),

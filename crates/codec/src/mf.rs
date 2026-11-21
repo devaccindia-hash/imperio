@@ -1,7 +1,7 @@
 //! Media Foundation H.264 encoder / decoder backends.
 
 use std::mem::ManuallyDrop;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
@@ -79,12 +79,25 @@ fn enum_transforms(
 }
 
 /// Shared transform driver: handles sync and async (hardware) MFTs.
+/// Longest wait for an encoder to answer an input (see `Transform::await_output`).
+const OUTPUT_WAIT: Duration = Duration::from_millis(40);
+
 struct Transform {
     mft: IMFTransform,
     is_async: bool,
     events: Option<IMFMediaEventGenerator>,
     /// Pending METransformNeedInput credits (async only).
     input_credits: u32,
+    /// Wait, after each input, for the output it produces (encoders). An
+    /// asynchronous transform announces its output a few milliseconds after
+    /// taking the input; collecting it only on the *next* call would send
+    /// every picture one screen change late, and leave the last picture of
+    /// any burst unsent until the screen changes again.
+    await_output: bool,
+    /// Inputs given whose output has not been collected yet (async only).
+    in_flight: u32,
+    /// Consecutive inputs whose output did not arrive within the wait.
+    late_outputs: u32,
     provides_samples: bool,
     output_size: u32,
     /// Subtype to re-select after MF_E_TRANSFORM_STREAM_CHANGE.
@@ -139,6 +152,9 @@ impl Transform {
             is_async,
             events,
             input_credits: 0,
+            await_output: false,
+            in_flight: 0,
+            late_outputs: 0,
             provides_samples: false,
             output_size: 0,
             output_subtype,
@@ -195,6 +211,7 @@ impl Transform {
                 self.input_credits += 1;
             } else if ty == METransformHaveOutput.0 as u32 {
                 if let Some(s) = self.process_output()? {
+                    self.in_flight = self.in_flight.saturating_sub(1);
                     outputs.push(s);
                 }
             }
@@ -210,7 +227,32 @@ impl Transform {
             }
             self.input_credits -= 1;
             unsafe { self.mft.ProcessInput(0, sample, 0) }.context("ProcessInput")?;
+            self.in_flight += 1;
             outputs.extend(self.pump(false)?);
+            if self.await_output {
+                // A low-latency encoder answers within a few milliseconds.
+                let deadline = Instant::now() + OUTPUT_WAIT;
+                while self.in_flight > 0 && Instant::now() < deadline {
+                    let got = self.pump(false)?;
+                    if got.is_empty() {
+                        std::thread::sleep(Duration::from_micros(200));
+                    } else {
+                        outputs.extend(got);
+                    }
+                }
+                if self.in_flight == 0 {
+                    self.late_outputs = 0;
+                } else {
+                    // An encoder that holds frames back by design never
+                    // answers in time: stop paying the wait for it. Its
+                    // output is still collected by `drain_ready`.
+                    self.late_outputs += 1;
+                    if self.late_outputs == 5 {
+                        self.await_output = false;
+                        tracing::warn!("encoder holds frames back; pictures will arrive a little later");
+                    }
+                }
+            }
         } else {
             unsafe { self.mft.ProcessInput(0, sample, 0) }.context("ProcessInput")?;
             while let Some(s) = self.process_output()? {
@@ -218,6 +260,15 @@ impl Transform {
             }
         }
         Ok(outputs)
+    }
+
+    /// Outputs that have become ready since the last call, without waiting.
+    fn drain_ready(&mut self) -> anyhow::Result<Vec<IMFSample>> {
+        if self.is_async {
+            self.pump(false)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// One ProcessOutput call. `None` when the MFT needs more input.
@@ -413,6 +464,7 @@ impl MfH264Encoder {
     ) -> anyhow::Result<Self> {
         let mft: IMFTransform = unsafe { act.ActivateObject() }.context("ActivateObject")?;
         let mut t = Transform::new(mft, is_hw.then_some(dev), MFVideoFormat_H264)?;
+        t.await_output = true;
         let api = t.codec_api();
 
         // Low latency, CBR, no B-frames, long GOP. Rejections are logged
@@ -543,6 +595,12 @@ impl VideoEncoder for MfH264Encoder {
             .iter()
             .map(|s| self.sample_to_frame(s, started))
             .collect()
+    }
+
+    fn poll(&mut self) -> anyhow::Result<Vec<EncodedFrame>> {
+        let now = Instant::now();
+        let ready = self.t.drain_ready()?;
+        ready.iter().map(|s| self.sample_to_frame(s, now)).collect()
     }
 
     fn set_bitrate(&mut self, kbps: u32) -> anyhow::Result<()> {

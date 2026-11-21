@@ -35,7 +35,10 @@ pub struct EncoderConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
-    /// Long GOP; keyframes are forced explicitly on packet loss instead.
+    /// Long GOP; keyframes are forced explicitly on packet loss instead. A
+    /// keyframe is many times the size of an ordinary frame and takes tens
+    /// of milliseconds to send, a visible hitch, so scheduled ones are rare
+    /// (they only help seeking in a recording).
     pub gop_frames: u32,
 }
 
@@ -47,7 +50,7 @@ impl Default for EncoderConfig {
             height: 1080,
             fps: 60,
             bitrate_kbps: 8_000,
-            gop_frames: 600,
+            gop_frames: 3600,
         }
     }
 }
@@ -62,6 +65,12 @@ pub trait VideoEncoder {
         pts_100ns: i64,
         force_keyframe: bool,
     ) -> anyhow::Result<Vec<EncodedFrame>>;
+    /// Frames that finished encoding since the last call, without waiting.
+    /// Called while the screen is still, so nothing stays inside an encoder
+    /// that answers late.
+    fn poll(&mut self) -> anyhow::Result<Vec<EncodedFrame>> {
+        Ok(Vec::new())
+    }
     /// Change the target bitrate on the fly (congestion control).
     fn set_bitrate(&mut self, kbps: u32) -> anyhow::Result<()>;
     fn config(&self) -> &EncoderConfig;
