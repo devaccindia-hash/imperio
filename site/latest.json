@@ -1,7 +1,7 @@
 {
-  "version": "0.3.13",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.13/Imperio.exe",
-  "sha256": "31dc8e01ea846b55dbd5b810304362bc09d9ce82b314eefe9de6f3208e7250b3",
-  "notes": "New: Disconnect button. End a session from either computer, or cancel while connecting.",
-  "sig": "g04RN0QPogiOkhu0PYfzeIvHczj71KPT5Z5dke3OXPtpRAd-HP2iesDMsygbUy4_16LqOcK6S9SmWGzlb1TUCQ"
+  "version": "0.3.14",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.14/Imperio.exe",
+  "sha256": "924acedbdd351de30da1328048c06ae85a23fdd13110338d68f1d1ee8183ff2e",
+  "notes": "Only one Imperio runs at a time: starting it closes any other copy that was left open.",
+  "sig": "G6rOdqrya-Kr9ONVMqLDLA6GmiLckPJptWkxiE8joQqNNQ1gR41nlSAbmnrf9Q6aKXsyNRi7CuyW92l5AuUaDg"
 }
