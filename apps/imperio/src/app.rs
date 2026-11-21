@@ -134,6 +134,8 @@ pub struct ImperioApp {
 
 pub fn run() -> anyhow::Result<()> {
     init_logging();
+    // Only one home window: this copy replaces any that is already running.
+    crate::single::enforce();
     // Window / taskbar icon follows the plan: red for Free, gold for Pro.
     let pro = config::load_or_create()
         .license_key
@@ -602,6 +604,7 @@ impl eframe::App for ImperioApp {
         if !self.first_frame_done {
             // The native window exists by the first frame.
             self.first_frame_done = true;
+            crate::single::started();
             dark_title_bar(frame);
             crate::tray::install(frame);
             if self.just_updated {

@@ -30,5 +30,6 @@ egui = "0.37"
 windows = { workspace = true, features = [
     "Win32_Graphics_Dwm",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_Shell",
 ] }

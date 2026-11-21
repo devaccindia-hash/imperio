@@ -12,6 +12,7 @@
 mod app;
 mod keys;
 mod license;
+mod single;
 mod tailscale;
 mod tray;
 mod update;
