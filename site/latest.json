@@ -1,7 +1,7 @@
 {
-  "version": "0.3.15",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.15/Imperio.exe",
-  "sha256": "938815f8dd53b1aadda5ab05716a8128482863d311645c1077d82712d4f7297b",
-  "notes": "Much smoother, faster sessions: fixed a delay that made the remote screen feel laggy and choppy. Update both computers.",
-  "sig": "GbWYDH7NCrubB8eYSum0GkeCebwlgU5hckACnEMoN8wOwh99T17TiVOMXw71ND7XXzF9D6fhzkAUbjHOxJ8EDw"
+  "version": "0.3.16",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.16/Imperio.exe",
+  "sha256": "4ccf5bac6b6dc1e4ca12e1d9a7073b843ceaf35cdcc56046e0c1992003cf6e0b",
+  "notes": "File transfer and file management between the two computers: a Files window with drag and drop, rename, copy, move and delete, plus copy and paste of files across.",
+  "sig": "Ztb8mBIeyqxURFWDss1zSGeMsCYmcSHAlmoC0XdrBmkV00VIu-qSx-3D7e7MfkPXqd001IFzUlMwNehOTJpLCw"
 }
