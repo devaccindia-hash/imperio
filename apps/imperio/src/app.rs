@@ -118,6 +118,10 @@ pub struct ImperioApp {
     hover_since: std::collections::HashMap<&'static str, Instant>,
     /// Install button armed by a first click until this instant (two-click install).
     confirm_until: Option<Instant>,
+    /// What the local Tailscale app reports (Tailscale mode only).
+    tailscale: Arc<Mutex<crate::tailscale::State>>,
+    /// When Tailscale was last asked; it is asked again every few seconds.
+    ts_asked: Option<Instant>,
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -146,7 +150,11 @@ pub fn run() -> anyhow::Result<()> {
 
 impl ImperioApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let cfg = config::load_or_create();
+        let mut cfg = config::load_or_create();
+        // Older versions saved the same ID once per spelling ("425 922 0101"
+        // and "4259220101"); show each computer once.
+        let mut seen = std::collections::HashSet::new();
+        cfg.recent = cfg.recent.iter().map(|r| canonical_target(r)).filter(|r| seen.insert(r.clone())).collect();
         let license = cfg
             .license_key
             .as_deref()
@@ -177,6 +185,8 @@ impl ImperioApp {
             just_updated: std::env::args().any(|a| a == "--updated"),
             hover_since: Default::default(),
             confirm_until: None,
+            tailscale: Default::default(),
+            ts_asked: None,
             cfg,
         };
         app.start_engine();
@@ -228,6 +238,40 @@ impl ImperioApp {
             .ok();
     }
 
+    /// Answer to "How do you want to connect?": Tailscale (no code, own
+    /// devices only) or the same network (address + code).
+    fn set_mode(&mut self, tailscale: bool) {
+        let changed = self.open_mode != tailscale;
+        self.open_mode = tailscale;
+        self.cfg.mode_chosen = true;
+        self.save_cfg();
+        if changed {
+            self.start_engine();
+        }
+        if tailscale {
+            self.refresh_tailscale();
+        }
+    }
+
+    /// Ask the Tailscale app for its computers, off the UI thread.
+    fn refresh_tailscale(&mut self) {
+        self.ts_asked = Some(Instant::now());
+        let state = self.tailscale.clone();
+        let ctx = self.ctx.clone();
+        std::thread::Builder::new()
+            .name("tailscale".into())
+            .spawn(move || {
+                let now = crate::tailscale::query();
+                if let Ok(mut g) = state.lock() {
+                    if *g != now {
+                        *g = now;
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .ok();
+    }
+
     fn save_cfg(&mut self) {
         self.cfg.require_accept = self.ask_first;
         self.cfg.open_mode = self.open_mode;
@@ -238,11 +282,11 @@ impl ImperioApp {
 
     /// Keep `target` at the top of the saved list (persisted in the config).
     fn remember(&mut self, target: String) {
-        let target = target.trim().to_string();
+        let target = canonical_target(&target);
         if target.is_empty() {
             return;
         }
-        self.cfg.recent.retain(|r| r != &target);
+        self.cfg.recent.retain(|r| canonical_target(r) != target);
         self.cfg.recent.insert(0, target);
         self.cfg.recent.truncate(12);
         self.save_cfg();
@@ -253,6 +297,17 @@ impl ImperioApp {
         if target.is_empty() {
             *self.session.lock().unwrap() =
                 SessionState::Failed("Type the other computer\u{2019}s address or ID first.".into());
+            return;
+        }
+        // An ID can only be looked up through an Imperio server. Without one,
+        // say so in plain words instead of starting a session that cannot work
+        // (and do not save the ID as a computer that can be clicked).
+        if self.cfg.server.is_none() && imperio_protocol::device_id::parse(&target).is_some() {
+            *self.session.lock().unwrap() = SessionState::Failed(
+                "Connecting by ID is not available yet. Type the other computer\u{2019}s address instead: \
+                 it is shown as \u{201c}Your address\u{201d} on its Imperio window."
+                    .into(),
+            );
             return;
         }
         self.remember(target.clone());
@@ -502,6 +557,14 @@ impl eframe::App for ImperioApp {
             Some(_) => self.copied = None,
             None => {}
         }
+        // In Tailscale mode keep the list of computers fresh (they come and go).
+        if self.open_mode && self.cfg.mode_chosen {
+            const EVERY: Duration = Duration::from_secs(8);
+            if self.ts_asked.is_none_or(|t| t.elapsed() >= EVERY) {
+                self.refresh_tailscale();
+            }
+            ctx.request_repaint_after(EVERY);
+        }
         let status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
         let host_error = self.host_error.lock().ok().and_then(|e| e.clone());
         let session = self.session.lock().map(|s| s.clone()).unwrap_or(SessionState::Idle);
@@ -579,6 +642,11 @@ impl eframe::App for ImperioApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(24, 4)))
             .show(ui, |ui| {
+                if !self.cfg.mode_chosen {
+                    self.mode_question(ui);
+                    return;
+                }
+                self.mode_row(ui);
                 self.your_id(ui, &status, host_error.as_deref());
                 ui.add_space(10.0);
                 self.tabs(ui);
@@ -600,7 +668,14 @@ impl ImperioApp {
             let code_w = 150.0;
             let gap = ui.spacing().item_spacing.x;
             let field_w = (ui.available_width() - connect_w - code_w - 2.0 * gap).max(220.0);
-            let enter = field(ui, &mut self.target, "Enter the other computer\u{2019}s address or ID", field_w, 17.0);
+            let hint = if self.cfg.server.is_some() {
+                "Enter the other computer\u{2019}s address or ID"
+            } else if self.open_mode && self.cfg.mode_chosen {
+                "Click a computer below, or type its address"
+            } else {
+                "Enter the other computer\u{2019}s address"
+            };
+            let enter = field(ui, &mut self.target, hint, field_w, 17.0);
             let enter2 = field(ui, &mut self.code, "Code (if any)", code_w, 16.0);
             let label = match session {
                 SessionState::Connecting => "Connecting\u{2026}",
@@ -617,7 +692,7 @@ impl ImperioApp {
             }
         });
         let line = match session {
-            SessionState::Failed(e) => Some((format!("\u{26A0} {e}"), ERROR)),
+            SessionState::Failed(e) => Some((e.clone(), ERROR)),
             SessionState::Connecting => Some(("Reaching the other computer\u{2026}".to_string(), MUTED)),
             SessionState::Connected => Some(("The remote screen is open in its own window. F11 for full screen.".to_string(), MUTED)),
             SessionState::Idle => Some((
@@ -711,23 +786,99 @@ impl ImperioApp {
         }
     }
 
-    /// Centered "Your ID 425 922 0101" with code and address underneath.
+    /// First run: one question, two answers. Nothing else on the page.
+    fn mode_question(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(26.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("How do you want to connect?").size(26.0).strong().color(TEXT));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Pick one. You can change it any time.").size(13.5).color(MUTED));
+        });
+        ui.add_space(20.0);
+        let mut pick: Option<bool> = None;
+        ui.columns(2, |cols| {
+            if choice_card(
+                &mut cols[0],
+                "With Tailscale",
+                "Works from anywhere: home, office, another city.",
+                &[
+                    "No code to type. Your computers appear as a list; click one.",
+                    "Needs the free Tailscale app on both computers, signed in to the same account.",
+                ],
+            ) {
+                pick = Some(true);
+            }
+            if choice_card(
+                &mut cols[1],
+                "On the same Wi-Fi or network",
+                "Both computers are in the same home or office.",
+                &[
+                    "Nothing else to install.",
+                    "You type the other computer\u{2019}s address and a 6-digit code it shows.",
+                ],
+            ) {
+                pick = Some(false);
+            }
+        });
+        if let Some(tailscale) = pick {
+            self.set_mode(tailscale);
+        }
+    }
+
+    /// "Connect: [With Tailscale] [Same network]" above everything else.
+    fn mode_row(&mut self, ui: &mut egui::Ui) {
+        let mut pick: Option<bool> = None;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Connect").size(13.5).color(MUTED));
+            ui.add_space(4.0);
+            for (tailscale, label) in [(true, "With Tailscale"), (false, "On the same network")] {
+                let on = self.open_mode == tailscale;
+                let b = egui::Button::new(RichText::new(label).size(13.0).color(if on { Color32::WHITE } else { TEXT }))
+                    .fill(if on { accent() } else { BUTTON })
+                    .stroke(Stroke::new(1.0, if on { accent() } else { STROKE }))
+                    .corner_radius(CornerRadius::same(255))
+                    .min_size(Vec2::new(0.0, 30.0));
+                if ui.add(b).clicked() && !on {
+                    pick = Some(tailscale);
+                }
+            }
+        });
+        if let Some(tailscale) = pick {
+            self.set_mode(tailscale);
+        }
+    }
+
+    /// The one thing to tell the other person, in large type: this computer's
+    /// address (or its ID when an Imperio server is configured), with the
+    /// code or the Tailscale state underneath.
     fn your_id(&mut self, ui: &mut egui::Ui, status: &HostStatus, host_error: Option<&str>) {
         let centered = Layout::left_to_right(Align::Center).with_main_align(Align::Center);
         let w = ui.available_width();
+        let by_id = self.cfg.server.is_some();
+        let ts = self.tailscale.lock().map(|t| t.clone()).unwrap_or_default();
+        let address = own_address(&status.addresses, self.open_mode);
+        // (label, shown, copied)
+        let (label, shown, copy) = if by_id {
+            let digits: String = status.device_id.chars().filter(|c| !c.is_whitespace()).collect();
+            ("Your ID", status.device_id.clone(), digits)
+        } else {
+            let a = address.clone().unwrap_or_default();
+            ("Your address", a.clone(), a)
+        };
         ui.add_space(2.0);
         ui.allocate_ui_with_layout(Vec2::new(w, 60.0), centered, |ui| {
-            ui.label(RichText::new("Your ID").size(20.0).color(MUTED));
+            ui.label(RichText::new(label).size(20.0).color(MUTED));
             ui.add_space(14.0);
-            let id = if status.device_id.is_empty() { "\u{2014}".to_string() } else { status.device_id.clone() };
-            ui.label(RichText::new(id).size(46.0).strong().color(accent()));
+            let big = if shown.is_empty() { "\u{2014}".to_string() } else { shown };
+            ui.label(RichText::new(big).size(46.0).strong().color(accent()));
             ui.add_space(12.0);
             let label = if self.copied_recently("id") { "Copied" } else { "Copy" };
-            if ghost_button(ui, label).clicked() && !status.device_id.is_empty() {
-                let digits: String = status.device_id.chars().filter(|c| !c.is_whitespace()).collect();
-                self.copy("id", digits);
+            if ghost_button(ui, label).clicked() && !copy.is_empty() {
+                self.copy("id", copy);
             }
         });
+        let mut recheck = false;
         ui.allocate_ui_with_layout(Vec2::new(w, 36.0), centered, |ui| {
             if let Some(code) = &status.code {
                 // "123 456" for the usual six digits; anything else as it is.
@@ -748,28 +899,66 @@ impl ImperioApp {
                     self.controls.regen_code.store(true, Ordering::Relaxed);
                 }
             } else if self.open_mode {
-                ui.label(RichText::new("No code needed for your own Tailscale devices").size(15.0).color(TEXT));
+                use crate::tailscale::State;
+                match ts {
+                    State::Unknown => {
+                        ui.label(RichText::new("Checking Tailscale\u{2026}").size(15.0).color(MUTED));
+                    }
+                    State::Running { .. } => {
+                        ui.label(
+                            RichText::new("No code needed. Only computers on your Tailscale account can connect.")
+                                .size(15.0)
+                                .color(TEXT),
+                        );
+                    }
+                    State::NotInstalled => {
+                        ui.label(RichText::new("Tailscale is not installed on this computer.").size(15.0).color(AMBER));
+                        ui.add_space(8.0);
+                        ui.hyperlink_to(
+                            RichText::new("Get Tailscale (free)").size(15.0).color(accent()),
+                            "https://tailscale.com/download",
+                        );
+                        ui.add_space(8.0);
+                        recheck = ghost_button(ui, "Check again").clicked();
+                    }
+                    State::Stopped => {
+                        ui.label(
+                            RichText::new("Tailscale is switched off or signed out. Open Tailscale and connect it.")
+                                .size(15.0)
+                                .color(AMBER),
+                        );
+                        ui.add_space(8.0);
+                        recheck = ghost_button(ui, "Check again").clicked();
+                    }
+                }
             } else if !status.security.is_empty() {
                 ui.label(RichText::new(&status.security).size(15.0).color(TEXT));
             }
         });
+        if recheck {
+            self.refresh_tailscale();
+        }
         ui.vertical_centered(|ui| {
             if status.code.is_some() {
                 ui.label(
-                    RichText::new("Tell the person who will connect your ID or address and this code. The code changes after each session.")
-                        .size(12.5)
-                        .color(MUTED),
+                    RichText::new(if by_id {
+                        "Tell the person who will connect your ID or address and this code. The code changes after each session."
+                    } else {
+                        "Tell the person who will connect this address and code. The code changes after each session."
+                    })
+                    .size(12.5)
+                    .color(MUTED),
                 );
             }
             if status.addresses.is_empty() {
                 ui.label(RichText::new("Looking up this computer\u{2019}s address\u{2026}").size(13.0).color(MUTED));
-            } else {
+            } else if by_id || (address.is_none() && !self.open_mode) {
                 let joined = status.addresses.join("   \u{2022}   ");
                 ui.label(RichText::new(format!("Your address:  {joined}")).size(13.0).color(TEXT));
             }
             ui.label(RichText::new(&status.status).size(12.5).color(MUTED));
             if let Some(e) = host_error {
-                ui.label(RichText::new(format!("\u{26A0} {e}")).size(12.5).color(ERROR));
+                ui.label(RichText::new(e).size(12.5).color(ERROR));
                 ui.label(RichText::new("Is another copy of Imperio already running?").size(12.0).color(MUTED));
             }
         });
@@ -806,35 +995,96 @@ impl ImperioApp {
 
     fn saved_tab(&mut self, ui: &mut egui::Ui, session: &SessionState) {
         let busy = matches!(session, SessionState::Connecting | SessionState::Connected);
-        if self.cfg.recent.is_empty() {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("No saved computers yet").size(17.0).strong().color(TEXT));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Computers you connect to are saved here automatically, so next time it\u{2019}s one click.")
-                        .size(13.0)
-                        .color(MUTED),
-                );
-            });
-            return;
-        }
         let mut connect_to: Option<String> = None;
         let mut remove: Option<String> = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
-            for r in self.cfg.recent.clone() {
-                let resp = tile(ui, &r, busy);
-                if resp.clicked() && !busy {
-                    connect_to = Some(r.clone());
+
+        // Tailscale mode: the account's computers, one click each.
+        let mut peer_ips: Vec<String> = Vec::new();
+        if self.open_mode {
+            use crate::tailscale::State;
+            let ts = self.tailscale.lock().map(|t| t.clone()).unwrap_or_default();
+            if let State::Running { peers } = ts {
+                ui.add_space(2.0);
+                ui.label(RichText::new("Your Tailscale computers").size(13.5).strong().color(TEXT));
+                ui.add_space(6.0);
+                if peers.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No other computers yet. On the other computer, install Tailscale and Imperio, \
+                             and sign in to Tailscale with the same account. It will appear here by itself.",
+                        )
+                        .size(13.0)
+                        .color(MUTED),
+                    );
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
+                        for p in &peers {
+                            let can = p.online && !busy;
+                            let (sub, color) = if !p.online {
+                                ("Offline \u{00b7} turn it on and open Tailscale", MUTED)
+                            } else if busy {
+                                ("session in progress", MUTED)
+                            } else {
+                                ("Online \u{00b7} click to connect", GREEN)
+                            };
+                            if tile(ui, &p.name, sub, color, can).clicked() && can {
+                                connect_to = Some(p.ip.clone());
+                            }
+                        }
+                    });
                 }
-                if resp.secondary_clicked() {
-                    remove = Some(r);
-                }
+                ui.add_space(14.0);
+                peer_ips = peers.into_iter().map(|p| p.ip).collect();
             }
-        });
-        ui.add_space(10.0);
-        ui.label(RichText::new("Click a computer to connect (uses the code typed above, if any). Right-click to remove.").size(12.0).color(MUTED));
+        }
+
+        // Saved computers that are not already shown above.
+        let saved: Vec<String> = self
+            .cfg
+            .recent
+            .iter()
+            .filter(|r| !peer_ips.iter().any(|ip| r.as_str() == ip || r.starts_with(&format!("{ip}:"))))
+            .cloned()
+            .collect();
+        if saved.is_empty() {
+            if !self.open_mode {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No saved computers yet").size(17.0).strong().color(TEXT));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Computers you connect to are saved here automatically, so next time it\u{2019}s one click.")
+                            .size(13.0)
+                            .color(MUTED),
+                    );
+                });
+            }
+        } else {
+            if self.open_mode {
+                ui.label(RichText::new("Saved computers").size(13.5).strong().color(TEXT));
+                ui.add_space(6.0);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
+                for r in saved {
+                    let (sub, color) = if busy { ("session in progress", MUTED) } else { ("Click to connect", accent()) };
+                    let resp = tile(ui, &r, sub, color, !busy);
+                    if resp.clicked() && !busy {
+                        connect_to = Some(r.clone());
+                    }
+                    if resp.secondary_clicked() {
+                        remove = Some(r);
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Click a computer to connect (uses the code typed above, if any). Right-click to remove.")
+                    .size(12.0)
+                    .color(MUTED),
+            );
+        }
         if let Some(r) = remove {
             self.cfg.recent.retain(|x| x != &r);
             self.save_cfg();
@@ -875,15 +1125,6 @@ impl ImperioApp {
             .id_salt("advanced")
             .show(ui, |ui| {
                 ui.add_space(4.0);
-                if toggle_row(
-                    ui,
-                    "No code for my own Tailscale devices",
-                    "Open mode: only Tailscale devices and this PC may connect",
-                    &mut self.open_mode,
-                ) {
-                    self.save_cfg();
-                    self.start_engine();
-                }
                 ui.checkbox(
                     &mut self.trust_new,
                     RichText::new("When connecting, accept a changed identity for that computer (only if you expected the change)")
@@ -1004,6 +1245,16 @@ impl ImperioApp {
 
 // ------------------------------------------------------------------ widgets
 
+/// One spelling per computer: a Device ID in its display form ("425 922 0101"
+/// however it was typed), anything else trimmed.
+fn canonical_target(target: &str) -> String {
+    let target = target.trim();
+    match imperio_protocol::device_id::parse(target) {
+        Some(id) => imperio_protocol::device_id::format(id),
+        None => target.to_string(),
+    }
+}
+
 /// Text field of a given width. Returns true when Enter was pressed in it.
 fn field(ui: &mut egui::Ui, value: &mut String, hint: &str, width: f32, size: f32) -> bool {
     let resp = ui
@@ -1039,10 +1290,61 @@ fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
-/// A saved computer as a clickable tile.
-fn tile(ui: &mut egui::Ui, addr: &str, busy: bool) -> egui::Response {
+/// The address to read out to the other person, taken from the host engine's
+/// list ("192.168.1.7:7700   (same Wi-Fi / network only)"). On the same
+/// network the Wi-Fi address is the right one even when a VPN address exists;
+/// the usual port is left off because the other side assumes it.
+fn own_address(addresses: &[String], tailscale: bool) -> Option<String> {
+    let parsed = |a: &String| -> Option<std::net::SocketAddr> { a.split_whitespace().next()?.parse().ok() };
+    let pick = if tailscale {
+        None
+    } else {
+        addresses.iter().filter(|a| a.contains("same Wi-Fi")).find_map(parsed)
+    }
+    .or_else(|| addresses.iter().find_map(parsed))?;
+    Some(if pick.port() == imperio_protocol::DEFAULT_PORT { pick.ip().to_string() } else { pick.to_string() })
+}
+
+/// One of the two answers to "How do you want to connect?". True when clicked.
+fn choice_card(ui: &mut egui::Ui, title: &str, lead: &str, points: &[&str]) -> bool {
+    let plain = |text: RichText| egui::Label::new(text).selectable(false);
+    let inner = egui::Frame::new()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0, STROKE))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(20, 18))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(190.0);
+            ui.add(plain(RichText::new(title).size(19.0).strong().color(TEXT)));
+            ui.add_space(4.0);
+            ui.add(plain(RichText::new(lead).size(14.0).color(TEXT)));
+            ui.add_space(10.0);
+            for p in points {
+                ui.add(plain(RichText::new(*p).size(13.0).color(MUTED)));
+                ui.add_space(4.0);
+            }
+            ui.add_space(8.0);
+            ui.add(plain(RichText::new("Choose this").size(13.5).strong().color(accent())));
+        });
+    let resp = ui
+        .interact(inner.response.rect, ui.scope_id().with(title), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.hovered() {
+        ui.painter().rect_stroke(
+            inner.response.rect,
+            CornerRadius::same(14),
+            Stroke::new(1.5, accent()),
+            StrokeKind::Inside,
+        );
+    }
+    resp.clicked()
+}
+
+/// A computer as a clickable tile: its name or address, and a line under it.
+fn tile(ui: &mut egui::Ui, title: &str, sub: &str, sub_color: Color32, enabled: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(228.0, 104.0), Sense::click());
-    let hovered = resp.hovered() && !busy;
+    let hovered = resp.hovered() && enabled;
     let p = ui.painter();
     p.rect(
         rect,
@@ -1052,27 +1354,22 @@ fn tile(ui: &mut egui::Ui, addr: &str, busy: bool) -> egui::Response {
         StrokeKind::Inside,
     );
     // Little monitor glyph.
+    let glyph = if enabled { accent() } else { MUTED };
     let m = egui::Rect::from_min_size(rect.min + Vec2::new(16.0, 16.0), Vec2::new(26.0, 17.0));
-    p.rect_stroke(m, CornerRadius::same(3), Stroke::new(1.8, accent()), StrokeKind::Inside);
-    p.line_segment([m.center_bottom() + Vec2::new(-6.0, 5.0), m.center_bottom() + Vec2::new(6.0, 5.0)], Stroke::new(1.8, accent()));
-    p.text(
-        rect.min + Vec2::new(16.0, 46.0),
-        Align2::LEFT_TOP,
-        addr,
-        FontId::proportional(16.0),
-        TEXT,
-    );
-    p.text(
-        rect.min + Vec2::new(16.0, 76.0),
-        Align2::LEFT_TOP,
-        if busy { "session in progress" } else { "Click to connect" },
-        FontId::proportional(12.5),
-        if busy { MUTED } else { accent() },
-    );
-    if busy {
-        resp
+    p.rect_stroke(m, CornerRadius::same(3), Stroke::new(1.8, glyph), StrokeKind::Inside);
+    p.line_segment([m.center_bottom() + Vec2::new(-6.0, 5.0), m.center_bottom() + Vec2::new(6.0, 5.0)], Stroke::new(1.8, glyph));
+    // Long computer names are cut rather than drawn over the next tile.
+    let shown: String = if title.chars().count() > 22 {
+        title.chars().take(21).chain(std::iter::once('\u{2026}')).collect()
     } else {
+        title.to_string()
+    };
+    p.text(rect.min + Vec2::new(16.0, 46.0), Align2::LEFT_TOP, shown, FontId::proportional(16.0), TEXT);
+    p.text(rect.min + Vec2::new(16.0, 76.0), Align2::LEFT_TOP, sub, FontId::proportional(12.5), sub_color);
+    if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
     }
 }
 

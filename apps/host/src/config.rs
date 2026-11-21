@@ -48,6 +48,9 @@ pub struct Config {
     pub license_key: Option<String>,
     /// Record every session to Videos\Imperio automatically.
     pub record_sessions: bool,
+    /// The user has answered "How do you want to connect?" (home window).
+    /// `open_mode` holds the answer: true = Tailscale, false = same network.
+    pub mode_chosen: bool,
 }
 
 impl Default for Config {
@@ -73,6 +76,7 @@ impl Default for Config {
             update_url: None,
             license_key: None,
             record_sessions: false,
+            mode_chosen: false,
         }
     }
 }

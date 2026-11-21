@@ -503,7 +503,7 @@ pub fn run_host(
                 }
                 if ips.is_empty() {
                     if open {
-                        vec!["(!) No Tailscale address found. Open mode needs Tailscale running on this PC; start it, then re-run.".into()]
+                        vec!["No Tailscale address found. Start Tailscale on this PC, or turn open mode off to share with a code.".into()]
                     } else {
                         vec![format!("This PC's network IP, port {} (run ipconfig)", cfg.port)]
                     }
