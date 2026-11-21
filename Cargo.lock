@@ -1177,6 +1177,7 @@ dependencies = [
  "ed25519-dalek",
  "eframe",
  "egui",
+ "imperio-files",
  "imperio-host",
  "imperio-protocol",
  "imperio-ui",
@@ -1251,6 +1252,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "imperio-files"
+version = "0.3.15"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "imperio-transport",
+ "postcard",
+ "serde",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "imperio-host"
 version = "0.3.15"
 dependencies = [
@@ -1261,6 +1275,7 @@ dependencies = [
  "imperio-capture",
  "imperio-clipboard",
  "imperio-codec",
+ "imperio-files",
  "imperio-protocol",
  "imperio-transport",
  "imperio-ui",
@@ -1325,6 +1340,7 @@ dependencies = [
  "imperio-audio",
  "imperio-clipboard",
  "imperio-codec",
+ "imperio-files",
  "imperio-protocol",
  "imperio-transport",
  "imperio-ui",

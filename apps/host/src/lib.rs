@@ -38,6 +38,7 @@ use imperio_transport::identity::{self, DeviceKey};
 use imperio_transport::link::{Incoming, SecureLink};
 use imperio_transport::pacer::Pacer;
 use imperio_transport::rendezvous::{self, Path};
+use imperio_transport::reliable::Reliable;
 use imperio_transport::{clip, lan, now_us};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
@@ -345,6 +346,7 @@ fn apply_flags(cfg: &mut Config, args: &[String]) -> anyhow::Result<()> {
             "--force-relay" => {} // handled at session time via a flag below
             "--no-cursor" => cfg.show_cursor = false,
             "--no-clipboard" => cfg.clipboard = false,
+            "--no-files" => cfg.file_access = false,
             "--port" => cfg.port = it.next().context("--port")?.parse()?,
             "--server" => cfg.server = Some(it.next().context("--server")?.clone()),
             // --code is a one-off session code handled in main(); skip its value here.
@@ -391,6 +393,9 @@ pub struct HostControls {
     /// Set to end the session in progress (the person at this computer
     /// pressed "Disconnect"); auto-cleared. Sharing stays on for the next one.
     pub end_session: Arc<AtomicBool>,
+    /// People who connect may use the files of this computer. Read on every
+    /// request, so switching it off takes effect in a running session.
+    pub file_access: Arc<AtomicBool>,
 }
 
 impl HostControls {
@@ -401,6 +406,7 @@ impl HostControls {
             regen_code: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             end_session: Arc::new(AtomicBool::new(false)),
+            file_access: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -451,6 +457,7 @@ pub fn cli_main(raw: Vec<String>) -> anyhow::Result<()> {
     apply_flags(&mut cfg, &raw)?;
     let open = open || cfg.open_mode;
     let controls = HostControls::new(cfg.require_accept);
+    controls.file_access.store(cfg.file_access, Ordering::Relaxed);
     // Status window + tray icon (skip with --no-ui, e.g. for scripted tests).
     let sink: Option<StatusSink> = if raw.iter().any(|a| a == "--no-ui") {
         None
@@ -679,6 +686,7 @@ pub fn run_host(
             totp_secret: totp_secret.clone(),
             ask_first: controls.ask_first.load(Ordering::Relaxed),
             end_session: controls.end_session.clone(),
+            file_access: controls.file_access.clone(),
         };
         match run_session(ctx, link, &socket) {
             Ok(SessionEnd::Bye) => failed_handshakes = 0,
@@ -708,6 +716,8 @@ struct SessionCtx<'a> {
     totp_secret: Arc<Option<Vec<u8>>>,
     /// See [`HostControls::end_session`].
     end_session: Arc<AtomicBool>,
+    /// See [`HostControls::file_access`].
+    file_access: Arc<AtomicBool>,
 }
 
 /// Tailscale / CGNAT address range (100.64.0.0/10). In open mode only peers
@@ -910,6 +920,8 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
     let last_feedback_us = Arc::new(AtomicU64::new(now_us()));
     // Clipboard sync starts only once the session is authorized (see below).
     let clipboard: Arc<OnceLock<ClipboardSync>> = Arc::new(OnceLock::new());
+    // The file service, likewise: it exists only for an authorized session.
+    let files: Arc<OnceLock<Reliable>> = Arc::new(OnceLock::new());
 
     let rx_thread = {
         let link = link.clone();
@@ -920,6 +932,7 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
         let target_kbps = target_kbps.clone();
         let last_feedback_us = last_feedback_us.clone();
         let clipboard = clipboard.clone();
+        let files = files.clone();
         let totp_secret = ctx.totp_secret.clone();
         let mut cc = BitrateController::new(cfg.bitrate_kbps, 500, cfg.bitrate_kbps);
         std::thread::Builder::new().name("session-rx".into()).spawn(move || {
@@ -993,6 +1006,15 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                             other => tracing::debug!(?other, "unexpected control message"),
                         }
                     }
+                    Some(Incoming::Stream { ack, body }) => {
+                        // Like every message that acts on this computer:
+                        // nothing before authorization.
+                        if authorized.load(Ordering::Acquire) {
+                            if let Some(f) = files.get() {
+                                f.handle(ack, body);
+                            }
+                        }
+                    }
                     Some(Incoming::Report(r)) => {
                         last_feedback_us.store(now_us(), Ordering::Relaxed);
                         if let Some(kbps) = cc.on_report(&r, now) {
@@ -1030,6 +1052,20 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
             let _ = clipboard.set(ClipboardSync::spawn(MAX_CLIPBOARD_BYTES, move |text| {
                 clip::send(&link, next_id.fetch_add(1, Ordering::Relaxed), text);
             }));
+        }
+
+        // File service: answers the viewer's requests while "Allow file
+        // access" is on. Always started, so a viewer is told when it is off.
+        {
+            let wire: Arc<dyn imperio_transport::reliable::Wire> = link.clone();
+            let (chan, inbox) = Reliable::start(wire);
+            imperio_files::Peer::start(
+                chan.clone(),
+                inbox,
+                imperio_files::Role::Host { allowed: ctx.file_access.clone() },
+                |_| {},
+            );
+            let _ = files.set(chan);
         }
 
         // Build the capture + encode pipeline now that the peer is trusted.
@@ -1079,6 +1115,9 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
     })();
 
     authorized.store(false, Ordering::Release);
+    if let Some(f) = files.get() {
+        f.close();
+    }
     // Let the viewer close (with a reason, if there is one) rather than sit
     // in front of a frozen picture.
     match &result {

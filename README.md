@@ -23,6 +23,7 @@ live in a separate private repository.
 | `crates/capture` | Screen capture (DXGI Desktop Duplication, WGC fallback), cursor shape, dirty rects |
 | `crates/codec` | Hardware encode/decode (NVENC / AMF / QuickSync), software fallback (VP9/AV1), D3D11 colour conversion |
 | `crates/protocol` | Wire format: frames, input events, clipboard, control messages |
+| `crates/files` | File access between the two computers: browse, transfer, rename, copy, move, delete (to the Recycle Bin) |
 | `crates/transport` | ICE connectivity, custom UDP media protocol (NACK + FEC + congestion control), TCP/443 relay fallback |
 | `apps/host` | Windows service + console-session helper (capture, input injection, UAC/login desktop) |
 | `apps/viewer` | Desktop viewer (decode, render, input send) |
@@ -52,6 +53,20 @@ cursor drawn into the stream; multi-monitor with viewer-side switching
 rotating session code; a Windows service wrapper (`install-service`) that
 runs a streaming helper in the active console session and follows the input
 desktop for UAC / lock screen.
+
+Files: a Files window in the session (Files > Browse and transfer files) shows
+both computers side by side. Drag between the sides, or drop files on the
+remote picture to send them to the other Desktop; right-click for rename,
+copy, move, new folder and delete (to the Recycle Bin). Copy and paste of
+files crosses too: copy files on your computer and press Ctrl+V in the
+session window, or copy files on the other computer (up to 200 MB) and paste
+them anywhere on yours; the Files window also reads and fills the Windows
+clipboard, so it works with Explorer. Transfers travel on
+the same encrypted link through a reliable stream with its own congestion
+control, never overwrite anything (a taken name is numbered), and are written
+under a temporary name until complete. The computer being viewed can switch
+this off (Sharing settings > Allow file access, or `--no-files`); the
+viewing computer never answers file requests.
 
 Security (Phase 5): persistent Ed25519 device identity with trust-on-first-use
 pinning (a changed host key is refused — the SSH known-hosts model); optional
@@ -94,8 +109,10 @@ target\release\imperio-viewer.exe --id 123456789 --server signal-host:7800 --cod
 ```
 
 Host flags: `--password PW` (persistent unattended access), `--monitor N`,
-`--no-cursor`, `--no-clipboard`, `--bitrate-kbps N`, `--fps N`. Viewer flags:
-`--no-input` (view only), `--force-relay`, `--totp 123456` (when the host
+`--no-cursor`, `--no-clipboard`, `--no-files`, `--bitrate-kbps N`, `--fps N`.
+Viewer flags: `--no-input` (view only), `--force-relay`,
+`--push <local path> <folder there>` and `--pull <path there> <local folder>`
+(one-off transfers once connected), `--totp 123456` (when the host
 requires a second factor), `--trust-new` (accept a changed host identity key).
 In the viewer, Ctrl+Shift+1..N switches the host display. The signal server
 lives in the private `imperio-cloud/signal` crate (`imperio-signal.exe

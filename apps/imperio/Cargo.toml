@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 imperio-host = { path = "../host" }
 imperio-viewer = { path = "../viewer" }
+imperio-files = { path = "../../crates/files" }
 imperio-protocol = { path = "../../crates/protocol" }
 imperio-ui = { path = "../../crates/ui" }
 anyhow.workspace = true
@@ -31,5 +32,6 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dwm",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Time",
     "Win32_UI_Shell",
 ] }

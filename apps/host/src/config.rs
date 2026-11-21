@@ -51,6 +51,8 @@ pub struct Config {
     /// The user has answered "How do you want to connect?" (home window).
     /// `open_mode` holds the answer: true = Tailscale, false = same network.
     pub mode_chosen: bool,
+    /// People who connect may browse, copy, rename and delete files here.
+    pub file_access: bool,
 }
 
 impl Default for Config {
@@ -77,6 +79,7 @@ impl Default for Config {
             license_key: None,
             record_sessions: false,
             mode_chosen: false,
+            file_access: true,
         }
     }
 }

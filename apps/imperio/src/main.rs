@@ -10,6 +10,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod files_ui;
 mod keys;
 mod license;
 mod single;
@@ -63,6 +64,8 @@ fn main() -> anyhow::Result<()> {
             imperio_host::cli_main(raw)
         }
         Some("session") => session_child(raw[1..].to_vec()),
+        // Internal: the Files window of a session (started by the session window).
+        Some("files-window") => files_ui::run(),
         _ => app::run(),
     }
 }
@@ -83,6 +86,9 @@ fn session_child(args: Vec<String>) -> anyhow::Result<()> {
         totp: None,
         record: false,
         end_on_stdin_close: false,
+        files_window: true,
+        open_files: false,
+        file_steps: Vec::new(),
         on_connected: Some(std::sync::Arc::new(|| {
             use std::io::Write;
             println!("connected");
@@ -102,6 +108,7 @@ fn session_child(args: Vec<String>) -> anyhow::Result<()> {
             "--trust-new" => req.trust_new = true,
             "--no-input" => req.send_input = false,
             "--record" => req.record = true,
+            "--files" => req.open_files = true,
             "--stdin-control" => req.end_on_stdin_close = true,
             s if !s.starts_with("--") => req.target = s.to_string(),
             _ => {}

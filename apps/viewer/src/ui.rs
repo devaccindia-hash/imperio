@@ -12,12 +12,12 @@ use std::sync::Mutex;
 use imperio_ui as ui;
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, SetWindowSubclass, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuRadioItem, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, ModifyMenuW,
     SetMenu, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, DM_GETDEFID, ES_AUTOHSCROLL, HMENU, IDCANCEL,
-    IDOK, MF_BYCOMMAND, MF_BYPOSITION, MF_POPUP, MF_SEPARATOR, MF_STRING, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WS_BORDER, WS_TABSTOP,
+    IDOK, MF_BYCOMMAND, MF_BYPOSITION, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_DROPFILES, WS_BORDER, WS_TABSTOP,
 };
 
 // ---------------------------------------------------------------- connect
@@ -177,8 +177,12 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
 // ------------------------------------------------------------- session menu
 
 /// Commands the session menu can issue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCmd {
+    /// Files > Browse: open the Files window.
+    Files,
+    /// Files or folders were dropped on the picture.
+    Dropped(Vec<std::path::PathBuf>),
     Disconnect,
     ToggleFullscreen,
     SelectDisplay(u8),
@@ -189,6 +193,7 @@ pub enum UiCmd {
 const ID_DISCONNECT: u16 = 1001;
 const ID_FULLSCREEN: u16 = 1002;
 const ID_RECORD: u16 = 1003;
+const ID_FILES: u16 = 1004;
 const ID_ABOUT: u16 = 1200;
 const ID_DISPLAY_BASE: u16 = 1100;
 const SUBCLASS_ID: usize = 0x1A9E;
@@ -236,14 +241,33 @@ impl SessionMenu {
             AppendMenuW(session, MF_STRING, ID_DISCONNECT as usize, &HSTRING::from("Disconnect")).ok()?;
             let displays = CreatePopupMenu().ok()?;
             AppendMenuW(displays, MF_STRING, ID_DISPLAY_BASE as usize, &HSTRING::from("Display 1\tCtrl+Shift+1")).ok()?;
+            let files = CreatePopupMenu().ok()?;
+            AppendMenuW(files, MF_STRING, ID_FILES as usize, &HSTRING::from("Browse and transfer files{2026}")).ok()?;
+            AppendMenuW(files, MF_SEPARATOR, 0, None).ok()?;
+            AppendMenuW(
+                files,
+                MF_STRING | MF_GRAYED,
+                0,
+                &HSTRING::from("Tip: drop files on this window to send them to the other Desktop"),
+            )
+            .ok()?;
+            AppendMenuW(
+                files,
+                MF_STRING | MF_GRAYED,
+                0,
+                &HSTRING::from("Tip: copy files on your computer, then press Ctrl+V here to paste them there"),
+            )
+            .ok()?;
             let help = CreatePopupMenu().ok()?;
             AppendMenuW(help, MF_STRING, ID_ABOUT as usize, &HSTRING::from("Shortcuts && about")).ok()?;
             AppendMenuW(bar, MF_POPUP, session.0 as usize, &HSTRING::from("Session")).ok()?;
             AppendMenuW(bar, MF_POPUP, displays.0 as usize, &HSTRING::from("Display")).ok()?;
+            AppendMenuW(bar, MF_POPUP, files.0 as usize, &HSTRING::from("Files")).ok()?;
             AppendMenuW(bar, MF_POPUP, help.0 as usize, &HSTRING::from("Help")).ok()?;
             SetMenu(hwnd, Some(bar)).ok()?;
             let _ = DrawMenuBar(hwnd);
             SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0).ok().ok()?;
+            DragAcceptFiles(hwnd, true);
             (bar, displays, session)
         };
         Some(Self { hwnd, bar, session, displays })
@@ -299,6 +323,22 @@ unsafe extern "system" fn subclass_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if msg == WM_DROPFILES {
+        let drop = HDROP(w.0 as *mut _);
+        let mut paths = Vec::new();
+        let count = DragQueryFileW(drop, u32::MAX, None);
+        for i in 0..count {
+            let len = DragQueryFileW(drop, i, None) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let got = DragQueryFileW(drop, i, Some(&mut buf)) as usize;
+            paths.push(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..got.min(len)])));
+        }
+        DragFinish(drop);
+        if !paths.is_empty() {
+            emit(UiCmd::Dropped(paths));
+        }
+        return LRESULT(0);
+    }
     // Menu commands arrive with the high word of WPARAM == 0.
     if msg == WM_COMMAND && (w.0 >> 16) & 0xFFFF == 0 {
         let id = ui::loword(w);
@@ -306,6 +346,7 @@ unsafe extern "system" fn subclass_proc(
             ID_DISCONNECT => Some(UiCmd::Disconnect),
             ID_FULLSCREEN => Some(UiCmd::ToggleFullscreen),
             ID_RECORD => Some(UiCmd::ToggleRecording),
+            ID_FILES => Some(UiCmd::Files),
             ID_ABOUT => Some(UiCmd::About),
             n if (ID_DISPLAY_BASE..ID_DISPLAY_BASE + 16).contains(&n) => {
                 Some(UiCmd::SelectDisplay((n - ID_DISPLAY_BASE) as u8))
@@ -327,6 +368,9 @@ pub fn about_text() -> String {
          F11 \u{2014} toggle full screen\n\
          Ctrl+Shift+1..9 \u{2014} switch the host display\n\
          Session > Start recording saves the session as an MP4 in Videos\\Imperio.\n\
+         Files > Browse and transfer files opens both computers side by side.\n\
+         Drop files on this window to send them to the other computer\u{2019}s Desktop.\n\
+         Copied files cross too: copy here and press Ctrl+V in this window, or copy there and paste here.\n\
          Close the window or use Session > Disconnect to end the session.\n\n\
          All traffic is end-to-end encrypted; the host identity is pinned on first use.\n\n\
          Proudly made with \u{2764} in India by Developer Inayat\n\

@@ -89,6 +89,73 @@ write_cfg
 NAME=5b; host --code 424242; $R/imperio-bench.exe probe-input 127.0.0.1:$PORT 424242 > $OUT/e2e-5b-probe.log 2>&1; kill_all
 check "mouse moves once fully authenticated" $OUT/e2e-5b-probe.log "PASS"
 
+echo "##### 9. file transfer over the encrypted link #####"
+FILES="$PROFILE/files"
+mkdir -p "$FILES/src/tree/sub/deeper" "$FILES/there" "$FILES/back"
+head -c 40000000 /dev/urandom > "$FILES/src/tree/big.bin"
+head -c 700001 /dev/urandom > "$FILES/src/tree/sub/mid.bin"
+echo "hello" > "$FILES/src/tree/sub/deeper/note.txt"
+: > "$FILES/src/tree/empty.dat"
+head -c 3000000 /dev/urandom > "$FILES/there/fetch-me.bin"
+W() { cygpath -w "$1"; }
+write_cfg
+NAME=9a; host --code 424242
+T=14 viewer 127.0.0.1:$PORT --code 424242 --push "$(W "$FILES/src/tree")" "$(W "$FILES/there")" --pull "$(W "$FILES/there/fetch-me.bin")" "$(W "$FILES/back")"; kill_all
+check "the other computer says files are allowed" $OUT/e2e-9a-viewer.log "file access: the other computer answered.*allowed=true"
+check "a folder was sent (4 files)" $OUT/e2e-9a-viewer.log "file transfer finished.*files=4 .*error=\"?none"
+check "a file was fetched" $OUT/e2e-9a-viewer.log "file transfer finished.*files=1 .*error=\"?none"
+check "the picture arrives in the same session" $OUT/e2e-9a-viewer.log "viewer.*fps"
+if diff -r "$FILES/src/tree" "$FILES/there/tree" >/dev/null 2>&1 && cmp -s "$FILES/there/fetch-me.bin" "$FILES/back/fetch-me.bin"; then
+  echo "  PASS  what arrived is identical to what was sent"; PASS=$((PASS+1))
+else
+  echo "  FAIL  what arrived differs from what was sent"; FAIL=$((FAIL+1))
+fi
+if find "$FILES" -name '*.imperio-part' | grep -q .; then
+  echo "  FAIL  a half-written file was left behind"; FAIL=$((FAIL+1))
+else
+  echo "  PASS  no half-written file is left"; PASS=$((PASS+1))
+fi
+NAME=9b; host --code 424242 --no-files
+T=9 viewer 127.0.0.1:$PORT --code 424242 --push "$(W "$FILES/src/tree/sub")" "$(W "$FILES/back")" --pull "$(W "$FILES/there/fetch-me.bin")" "$(W "$FILES/src")"; kill_all
+check "file access off: the viewer is told" $OUT/e2e-9b-viewer.log "file access: the other computer answered.*allowed=false"
+check "file access off: sending is refused" $OUT/e2e-9b-viewer.log "file transfer finished.*turned off"
+if [ ! -e "$FILES/back/sub" ] && [ ! -e "$FILES/src/fetch-me.bin" ]; then
+  echo "  PASS  file access off: nothing was written or read"; PASS=$((PASS+1))
+else
+  echo "  FAIL  file access off: files moved anyway"; FAIL=$((FAIL+1))
+fi
+
+echo "##### 10. copied files cross between the two clipboards #####"
+# Uses the real Windows clipboard; text that was on it is put back afterwards.
+PSH() { powershell -NoProfile -Command "$1" 2>/dev/null | tr -d '\r'; }
+CLIPSAVE="$(PSH 'Get-Clipboard -Raw')"
+NAME=10a; host --code 424242
+T=9 viewer 127.0.0.1:$PORT --code 424242 --push "$(W "$FILES/src/tree/sub")" "::clipboard"
+PSH '(Get-Clipboard -Format FileDropList).FullName' > $OUT/e2e-10a-clip.txt; kill_all
+check "copy here, paste there: the files reach the other clipboard" $OUT/e2e-10a-host.log "copied files are on the clipboard"
+check "that clipboard points at a staging folder" $OUT/e2e-10a-clip.txt 'Imperio-clipboard.*sub$'
+STAGED="$(cygpath -u "$(head -1 $OUT/e2e-10a-clip.txt)" 2>/dev/null)"
+if [ -n "$STAGED" ] && diff -r "$FILES/src/tree/sub" "$STAGED" >/dev/null 2>&1; then
+  echo "  PASS  the staged files are identical"; PASS=$((PASS+1))
+else
+  echo "  FAIL  the staged files differ or are missing"; FAIL=$((FAIL+1))
+fi
+NAME=10b; host --code 424242
+(T=13 viewer 127.0.0.1:$PORT --code 424242 &)
+sleep 6; PSH "Set-Clipboard -Path '$(W "$FILES/there/fetch-me.bin")'"; sleep 4
+PSH '(Get-Clipboard -Format FileDropList).FullName' > $OUT/e2e-10b-clip.txt; sleep 4; kill_all
+check "copy there: the viewer fetches the files" $OUT/e2e-10b-viewer.log "fetching the files copied on the other computer"
+check "this clipboard points at the fetched copy" $OUT/e2e-10b-clip.txt 'Imperio-clipboard.*fetch-me.bin$'
+FETCHED="$(cygpath -u "$(head -1 $OUT/e2e-10b-clip.txt)" 2>/dev/null)"
+if [ -n "$FETCHED" ] && cmp -s "$FILES/there/fetch-me.bin" "$FETCHED"; then
+  echo "  PASS  the fetched file is identical"; PASS=$((PASS+1))
+else
+  echo "  FAIL  the fetched file differs or is missing"; FAIL=$((FAIL+1))
+fi
+N=$(strip $OUT/e2e-10b-viewer.log | grep -c "fetching the files copied")
+[ "$N" = 1 ] && { echo "  PASS  no echo between the clipboards (fetched once)"; PASS=$((PASS+1)); } || { echo "  FAIL  fetched $N times"; FAIL=$((FAIL+1)); }
+if [ -n "$CLIPSAVE" ]; then printf '%s' "$CLIPSAVE" | clip.exe; else PSH 'Set-Clipboard -Value $null'; fi
+
 if [ -x "$S/imperio-signal.exe" ]; then
   BIND="$PROFILE/bindings.txt"
   echo "##### 6. signal server: connect by Device ID (direct path) #####"

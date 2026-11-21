@@ -24,17 +24,17 @@ use imperio_host::config::{self, Config};
 use imperio_host::{HostControls, HostOptions, HostStatus, StatusSink};
 
 // Palette (near-black with a red accent, after the AnyDesk reference).
-const BG: Color32 = Color32::from_rgb(0x1B, 0x1B, 0x1D);
-const CARD: Color32 = Color32::from_rgb(0x25, 0x25, 0x28);
-const CARD_HOVER: Color32 = Color32::from_rgb(0x2E, 0x2E, 0x32);
-const STROKE: Color32 = Color32::from_rgb(0x38, 0x38, 0x3C);
-const FIELD: Color32 = Color32::from_rgb(0x2B, 0x2B, 0x2F);
-const BUTTON: Color32 = Color32::from_rgb(0x33, 0x33, 0x37);
-const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF2, 0xF2);
-const MUTED: Color32 = Color32::from_rgb(0x9C, 0x9C, 0xA4);
-const GREEN: Color32 = Color32::from_rgb(0x3D, 0xDC, 0x84);
+pub(crate) const BG: Color32 = Color32::from_rgb(0x1B, 0x1B, 0x1D);
+pub(crate) const CARD: Color32 = Color32::from_rgb(0x25, 0x25, 0x28);
+pub(crate) const CARD_HOVER: Color32 = Color32::from_rgb(0x2E, 0x2E, 0x32);
+pub(crate) const STROKE: Color32 = Color32::from_rgb(0x38, 0x38, 0x3C);
+pub(crate) const FIELD: Color32 = Color32::from_rgb(0x2B, 0x2B, 0x2F);
+pub(crate) const BUTTON: Color32 = Color32::from_rgb(0x33, 0x33, 0x37);
+pub(crate) const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF2, 0xF2);
+pub(crate) const MUTED: Color32 = Color32::from_rgb(0x9C, 0x9C, 0xA4);
+pub(crate) const GREEN: Color32 = Color32::from_rgb(0x3D, 0xDC, 0x84);
 const AMBER: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54);
-const ERROR: Color32 = Color32::from_rgb(0xFF, 0x7B, 0x72);
+pub(crate) const ERROR: Color32 = Color32::from_rgb(0xFF, 0x7B, 0x72);
 
 /// Accent colour as 0xRRGGBB: red on the Free plan, gold once a Pro licence
 /// is active, so paying users see the difference everywhere at once.
@@ -42,7 +42,7 @@ static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 const FREE_ACCENT: u32 = 0xE6453B;
 const PRO_ACCENT: u32 = 0xE3B341;
 
-fn accent() -> Color32 {
+pub(crate) fn accent() -> Color32 {
     let v = ACCENT_RGB.load(Ordering::Relaxed);
     Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
 }
@@ -54,7 +54,7 @@ fn accent_hover() -> Color32 {
 }
 
 /// Switch the look between Free (red) and Pro (gold) and re-apply the theme.
-fn set_pro_look(pro: bool, ctx: &egui::Context) {
+pub(crate) fn set_pro_look(pro: bool, ctx: &egui::Context) {
     ACCENT_RGB.store(if pro { PRO_ACCENT } else { FREE_ACCENT }, Ordering::Relaxed);
     apply_theme(ctx);
 }
@@ -218,6 +218,7 @@ impl ImperioApp {
         let prev = self.engine.take();
         let controls = HostControls::new(self.ask_first);
         controls.accepting.store(self.allow, Ordering::Relaxed);
+        controls.file_access.store(self.cfg.file_access, Ordering::Relaxed);
         self.controls = controls.clone();
         let cfg = self.cfg.clone();
         let open = self.open_mode;
@@ -1197,6 +1198,15 @@ impl ImperioApp {
         }
         if toggle_row(
             ui,
+            "Allow file access",
+            "People who connect can browse, copy, rename and delete files on this PC",
+            &mut self.cfg.file_access,
+        ) {
+            self.controls.file_access.store(self.cfg.file_access, Ordering::Relaxed);
+            self.save_cfg();
+        }
+        if toggle_row(
+            ui,
             "Record my sessions",
             "Saved as MP4 in Videos \u{203a} Imperio (also in the session menu)",
             &mut self.cfg.record_sessions,
@@ -1364,7 +1374,7 @@ fn field(ui: &mut egui::Ui, value: &mut String, hint: &str, width: f32, size: f3
     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
-fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).size(13.0).color(TEXT))
             .fill(BUTTON)
@@ -1546,7 +1556,7 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
 
 // -------------------------------------------------------------------- theme
 
-fn apply_theme(ctx: &egui::Context) {
+pub(crate) fn apply_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
@@ -1593,7 +1603,7 @@ fn apply_theme(ctx: &egui::Context) {
 }
 
 /// Ask DWM for a dark title bar so the frame matches the content.
-fn dark_title_bar(frame: &eframe::Frame) {
+pub(crate) fn dark_title_bar(frame: &eframe::Frame) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
     if let Ok(h) = frame.window_handle() {
@@ -1611,6 +1621,11 @@ fn dark_title_bar(frame: &eframe::Frame) {
             }
         }
     }
+}
+
+/// The icon for the plan: red for Free, gold for Pro.
+pub(crate) fn icon_for(pro: bool) -> egui::IconData {
+    icon(if pro { PRO_ACCENT } else { FREE_ACCENT })
 }
 
 /// Window / taskbar / tray icon: rounded square in `rgb` with a white dot.

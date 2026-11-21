@@ -9,7 +9,10 @@
 //!   imperio-viewer                      (opens the connect dialog)
 //!   imperio-viewer <host-ip[:port]> --code 123456 [--no-input]
 //!   imperio-viewer --id 123456789 --server host:7800 --code 123456 [--no-input] [--force-relay]
+//!   ... --push <local path> <folder there>   send a file or folder once connected
+//!   ... --pull <path there> <local folder>   fetch one
 
+pub mod files;
 mod known_hosts;
 mod render;
 mod ui;
@@ -72,6 +75,7 @@ struct Args {
     trust_new: bool,
     send_input: bool,
     force_relay: bool,
+    file_steps: Vec<files::Step>,
 }
 
 /// Drop all whitespace (spaces, tabs, and stray CR/LF from `set /p` or a
@@ -90,6 +94,7 @@ fn parse_args(raw: Vec<String>) -> anyhow::Result<Args> {
         trust_new: false,
         send_input: true,
         force_relay: false,
+        file_steps: Vec::new(),
     };
     let mut it = raw.into_iter();
     while let Some(k) = it.next() {
@@ -97,6 +102,14 @@ fn parse_args(raw: Vec<String>) -> anyhow::Result<Args> {
             "--no-input" => a.send_input = false,
             "--force-relay" => a.force_relay = true,
             "--trust-new" => a.trust_new = true,
+            "--push" => a.file_steps.push(files::Step::Push {
+                local: it.next().context("--push <local path> <folder there>")?.into(),
+                remote_dir: it.next().context("--push <local path> <folder there>")?,
+            }),
+            "--pull" => a.file_steps.push(files::Step::Pull {
+                remote: it.next().context("--pull <path there> <local folder>")?,
+                local_dir: it.next().context("--pull <path there> <local folder>")?.into(),
+            }),
             "--id" => a.id = Some(strip_ws(&it.next().context("--id value")?).parse()?),
             "--server" => a.server = Some(it.next().context("--server value")?.trim().to_string()),
             "--code" => a.code = Some(strip_ws(&it.next().context("--code value")?)),
@@ -114,6 +127,10 @@ struct App {
     send_input: bool,
     totp: Option<String>,
     clipboard: Option<Arc<ClipboardSync>>,
+    files: Arc<files::FileBridge>,
+    /// The V of a Ctrl+V that was taken over to send files: its release is
+    /// not passed on either.
+    swallow_v: bool,
     menu: Option<ui::SessionMenu>,
     fullscreen: bool,
     /// Recording wanted; the recorder is created at the first keyframe once
@@ -305,7 +322,12 @@ impl ApplicationHandler<Net> for App {
         if self.window.is_some() {
             return;
         }
+        // File drops are taken as WM_DROPFILES by our own window hook (see
+        // `ui::SessionMenu`), which does not depend on how COM was set up on
+        // this thread; winit's OLE drop target would take them first.
+        use winit::platform::windows::WindowAttributesExtWindows;
         let attrs = Window::default_attributes()
+            .with_drag_and_drop(false)
             .with_title("imperio viewer - connecting...")
             .with_inner_size(PhysicalSize::new(1280u32, 720u32));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
@@ -389,6 +411,8 @@ impl ApplicationHandler<Net> for App {
                     }
                 }
                 ui::UiCmd::ToggleRecording => self.toggle_recording(),
+                ui::UiCmd::Files => self.files.open_window(),
+                ui::UiCmd::Dropped(paths) => self.files.send_dropped(paths),
                 ui::UiCmd::About => imperio_ui::info_box("Imperio viewer", &ui::about_text()),
             },
             Net::Bye => {
@@ -465,6 +489,19 @@ impl ApplicationHandler<Net> for App {
                         }
                     }
                 }
+                // Ctrl+V while this computer's clipboard holds copied files:
+                // they are sent to the other clipboard first, and the paste
+                // follows by itself once they are there.
+                if event.physical_key == PhysicalKey::Code(KeyCode::KeyV) {
+                    if down && !event.repeat && self.ctrl && !self.shift && self.files.paste_files() {
+                        self.swallow_v = true;
+                        return;
+                    }
+                    if self.swallow_v {
+                        self.swallow_v = down;
+                        return;
+                    }
+                }
                 // winit's Windows scancode is a 16-bit extended scancode:
                 // high byte 0xE0 marks extended keys.
                 let (scancode, extended) = match event.physical_key {
@@ -506,7 +543,13 @@ struct RxOptions {
 }
 
 /// Network thread: receive, NACK/report housekeeping, frame assembly, RTT.
-fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy<Net>, opts: RxOptions) {
+fn spawn_rx(
+    socket: Arc<UdpSocket>,
+    link: Arc<SecureLink>,
+    proxy: EventLoopProxy<Net>,
+    files: imperio_transport::reliable::Reliable,
+    opts: RxOptions,
+) {
     let RxOptions { trust_new, expect_id, totp, end_reason } = opts;
     // End the session with an explanation the user will see.
     let fail = move |proxy: &EventLoopProxy<Net>, why: String| {
@@ -648,6 +691,7 @@ fn spawn_rx(socket: Arc<UdpSocket>, link: Arc<SecureLink>, proxy: EventLoopProxy
                                     }
                                     _ => {}
                                 },
+                                Some(Incoming::Stream { ack, body }) => files.handle(ack, body),
                                 Some(Incoming::Audio { codec, payload, .. }) => {
                                     use imperio_audio::AudioDecoder;
                                     if let (Some(pb), Some(tag)) =
@@ -971,6 +1015,12 @@ pub struct SessionRequest {
     /// End the session when standard input closes. The home window holds the
     /// other end of that pipe: its Disconnect button (or its exit) closes it.
     pub end_on_stdin_close: bool,
+    /// This program has the Files window (`imperio files-window`).
+    pub files_window: bool,
+    /// Open the Files window as soon as the session starts.
+    pub open_files: bool,
+    /// Transfers to run once connected (command line).
+    pub file_steps: Vec<files::Step>,
 }
 
 /// Command-line entry: parse flags, ask through the connect dialog when no
@@ -981,7 +1031,7 @@ pub fn cli_main(raw: Vec<String>) -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
         )
         .try_init();
-    let args = parse_args(raw)?;
+    let mut args = parse_args(raw)?;
     let mut request = ui::ConnectRequest {
         target: args
             .direct
@@ -1012,6 +1062,9 @@ pub fn cli_main(raw: Vec<String>) -> anyhow::Result<()> {
             on_connected: None,
             record: false,
             end_on_stdin_close: false,
+            files_window: false,
+            open_files: false,
+            file_steps: std::mem::take(&mut args.file_steps),
         };
         match run_session(req) {
             Ok(()) => return Ok(()),
@@ -1027,7 +1080,7 @@ pub fn cli_main(raw: Vec<String>) -> anyhow::Result<()> {
 
 /// Connect to `req.target` and run the session window until it closes.
 /// Works from any thread: the home app calls it from a worker thread.
-pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
+pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
     use winit::platform::windows::EventLoopBuilderExtWindows;
     imperio_codec::mf::startup()?;
     let mut args = Args {
@@ -1039,6 +1092,7 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
         trust_new: req.trust_new,
         send_input: req.send_input,
         force_relay: req.force_relay,
+        file_steps: Vec::new(),
     };
     let target = req.target.trim().to_string();
     if target.is_empty() {
@@ -1065,10 +1119,16 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
 
     let end_reason: EndReason = Arc::new(Mutex::new(None));
     let event_loop = EventLoop::<Net>::with_user_event().with_any_thread(true).build()?;
+    let files = files::FileBridge::start(link.clone(), req.files_window, args.send_input);
+    files.run_script(std::mem::take(&mut req.file_steps));
+    if req.open_files {
+        files.open_window();
+    }
     spawn_rx(
         socket.clone(),
         link.clone(),
         event_loop.create_proxy(),
+        files.channel(),
         RxOptions {
             trust_new: args.trust_new,
             expect_id: args.id,
@@ -1113,6 +1173,8 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
         send_input: args.send_input,
         totp: args.totp.clone(),
         clipboard,
+        files: files.clone(),
+        swallow_v: false,
         window: None,
         renderer: None,
         decoder: None,
@@ -1133,6 +1195,7 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
         recorder: None,
     };
     event_loop.run_app(&mut app)?;
+    files.shutdown();
     app.stop_recording(false);
     // Ended by the network side (refused, identity problem, link lost)?
     if let Some(why) = end_reason.lock().ok().and_then(|mut r| r.take()) {

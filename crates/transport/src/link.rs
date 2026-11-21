@@ -32,6 +32,10 @@ const INNER_CONTROL: u8 = 1;
 const INNER_NACK: u8 = 2;
 const INNER_REPORT: u8 = 3;
 const INNER_AUDIO: u8 = 4;
+// Reliable stream (see `reliable`): data segments and their acknowledgements.
+// Peers older than this ignore unknown inner kinds.
+const INNER_STREAM: u8 = 5;
+const INNER_STREAM_ACK: u8 = 6;
 
 /// Bytes of sent media kept for retransmission (~1.5 s at 8 Mbps).
 const HISTORY_BYTES: usize = 1_500_000;
@@ -71,6 +75,12 @@ pub enum Incoming {
     },
     Control(ControlMessage),
     Report(ReceiverReport),
+    /// A datagram of the reliable stream; hand it to
+    /// [`crate::reliable::Reliable::handle`].
+    Stream {
+        ack: bool,
+        body: Bytes,
+    },
 }
 
 struct TxState {
@@ -248,6 +258,15 @@ impl SecureLink {
         self.seal_and_send(&mut tx, &inner).map(|_| ())
     }
 
+    /// Send one datagram of the reliable stream (a data segment or an ack).
+    pub fn send_stream(&self, ack: bool, body: &[u8]) -> io::Result<()> {
+        let mut inner = Vec::with_capacity(1 + body.len());
+        inner.push(if ack { INNER_STREAM_ACK } else { INNER_STREAM });
+        inner.extend_from_slice(body);
+        let mut tx = self.tx.lock().unwrap();
+        self.seal_and_send(&mut tx, &inner).map(|_| ())
+    }
+
     fn send_nack(&self, seqs: &[u32]) -> io::Result<()> {
         let mut inner = BytesMut::with_capacity(3 + seqs.len() * 4);
         inner.put_u8(INNER_NACK);
@@ -352,6 +371,10 @@ impl SecureLink {
                 postcard::from_bytes::<ReceiverReport>(&body)
                     .ok()
                     .map(Incoming::Report)
+            }
+            kind @ (INNER_STREAM | INNER_STREAM_ACK) => {
+                drop(rx);
+                Some(Incoming::Stream { ack: kind == INNER_STREAM_ACK, body })
             }
             _ => None,
         }

@@ -8,6 +8,7 @@ license.workspace = true
 imperio-audio = { path = "../../crates/audio" }
 imperio-clipboard = { path = "../../crates/clipboard" }
 imperio-codec = { path = "../../crates/codec" }
+imperio-files = { path = "../../crates/files" }
 imperio-protocol = { path = "../../crates/protocol" }
 imperio-transport = { path = "../../crates/transport" }
 imperio-ui = { path = "../../crates/ui" }

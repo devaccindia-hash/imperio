@@ -12,6 +12,8 @@
 //!   keyframe resync.
 //! * [`cc`]: adaptive bitrate from receiver reports.
 //! * [`lan`]: frame <-> chunk framing.
+//! * [`reliable`]: an ordered, acknowledged message stream on the same link
+//!   (file transfer), with its own flow and congestion control.
 //!
 //! Every market leader runs its own UDP protocol rather than WebRTC; this is
 //! ours. ICE-style connectivity is intentionally decoupled so a browser
@@ -25,6 +27,7 @@ pub mod jitter;
 pub mod lan;
 pub mod link;
 pub mod pacer;
+pub mod reliable;
 pub mod rendezvous;
 pub mod totp;
 

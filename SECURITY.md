@@ -19,7 +19,8 @@ you want it.
 | Pairing | SPAKE2 from the code shown on the host. Someone watching the network learns nothing about the code and gets one guess per attempt; the host backs off after failures and issues a new code after three. |
 | Encryption | ChaCha20-Poly1305, one key per direction, a fresh key every session. Relays and the signal server only ever carry ciphertext. A 4096-entry replay window rejects replayed datagrams. |
 | Key confirmation | The viewer only opens a session window once a datagram from the host has opened under the session key, so a wrong code is reported as a wrong code. |
-| Authorization gate | Holding the session key proves the peer knew the code, nothing more. Until the optional second factor (TOTP) and the optional "Allow?" prompt have also passed, the host ignores every input, clipboard and display message from that peer, and sends it no clipboard. |
+| Authorization gate | Holding the session key proves the peer knew the code, nothing more. Until the optional second factor (TOTP) and the optional "Allow?" prompt have also passed, the host ignores every input, clipboard, display and file message from that peer, and sends it no clipboard. |
+| File access | Only the computer being viewed answers file requests; the viewing computer never does, so connecting to a computer does not expose yours. Received files are written only under the folder that was chosen: every part of a received path is checked, and anything that could step outside it is refused. Nothing is overwritten, deletes go to the Recycle Bin, and the host logs each change that was asked for. |
 | Host identity | Each host has a long-term Ed25519 key and signs the session's channel binding with it. The viewer pins the key on first use and refuses a different key later (the SSH `known_hosts` model). When connecting by Device ID, the host must present the ID that was asked for. |
 | Open mode | "No code for my own Tailscale devices" uses a public pairing secret, so the network is the gate: only tailnet (100.64.0.0/10) and loopback peers are accepted, however the peer was found. |
 | Signal server | Device IDs are bound to the device's identity key permanently (across the device being offline and server restarts). Clients accept signaling only from the server's address, and probe only genuine LAN addresses plus the address the server observed. |
@@ -35,6 +36,16 @@ you want it.
   you set them, the unattended password and TOTP secret, in plain text.
   On a shared computer, another local user can read them. Do not configure an
   unattended password on a PC that people you do not trust can log in to.
+- **File access means all files.** While "Allow file access" is on (the
+  default), whoever is allowed to connect can read, copy, rename, move and
+  delete anything the Imperio process can reach on that PC. In open mode
+  that is every device on your Tailscale account. Turn the switch off on a
+  PC whose files should stay put. When Imperio runs as the Windows service,
+  the process is SYSTEM and can reach every user's files.
+- **Copied files travel while file access is on.** When files are copied on
+  the computer being viewed, the viewing computer is told which, and fetches
+  them (up to 200 MB) so they can be pasted. With "Allow file access" off,
+  nothing about the clipboard's files is sent.
 - **The six-digit code is only as strong as its lifetime.** It is meant to be
   read out and used within minutes. For standing access use a long password
   plus TOTP, or open mode behind Tailscale.

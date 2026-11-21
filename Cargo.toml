@@ -6,6 +6,7 @@ members = [
     "crates/capture",
     "crates/clipboard",
     "crates/codec",
+    "crates/files",
     "crates/protocol",
     "crates/transport",
     "apps/host",

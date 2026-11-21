@@ -30,7 +30,19 @@ Copy this WHOLE folder to BOTH PCs.
   Saved computers: anything you connect to appears as a tile for one-click
   reconnects (right-click a tile to remove it).
 
-  Sharing settings tab: pause sharing, ask before someone connects, record
+  Files: in the remote-screen window choose Files > Browse and transfer
+  files. This computer is on the left, the other one on the right. Drag
+  files or folders from one side to the other, or use the Send / Bring
+  buttons. Right-click for rename, copy, move, new folder and delete (to the
+  Recycle Bin). You can also drop files straight onto the remote picture:
+  they go to the other computer's Desktop. Copy and paste works across the
+  two computers as well: copy files here and press Ctrl+V in the remote-screen
+  window, or copy files there (up to 200 MB) and paste them here once they
+  have arrived. Both computers need 0.3.16 or
+  newer.
+
+  Sharing settings tab: pause sharing, ask before someone connects, allow
+  file access (on by default; turn off to keep this PC's files private), record
   sessions (MP4 in Videos\Imperio - also Session > Start recording in the
   remote-screen window), your plan (Free / Pro licence key), and updates
   (checked at start; "Download and install" replaces the exe and restarts).

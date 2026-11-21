@@ -1,0 +1,22 @@
+[package]
+name = "imperio-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "File access between the two computers of a session: browse, transfer, rename, copy, move, delete"
+
+[dependencies]
+imperio-transport = { path = "../transport" }
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+postcard.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+bytes.workspace = true
