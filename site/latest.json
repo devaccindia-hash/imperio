@@ -1,7 +1,7 @@
 {
-  "version": "0.3.16",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.16/Imperio.exe",
-  "sha256": "4ccf5bac6b6dc1e4ca12e1d9a7073b843ceaf35cdcc56046e0c1992003cf6e0b",
-  "notes": "File transfer and file management between the two computers: a Files window with drag and drop, rename, copy, move and delete, plus copy and paste of files across.",
-  "sig": "Ztb8mBIeyqxURFWDss1zSGeMsCYmcSHAlmoC0XdrBmkV00VIu-qSx-3D7e7MfkPXqd001IFzUlMwNehOTJpLCw"
+  "version": "0.3.17",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.17/Imperio.exe",
+  "sha256": "f63c98f313363a3e57e32721179b857427acb26d4889c6d716d1e7b8aa514a24",
+  "notes": "Drag a file out of the remote screen onto your own Desktop or a folder, and a View menu with zoom.",
+  "sig": "4LHaXIiaZElbPsrsrz7uMzhSlWH1nweTfO6JgMu1LCJ-3B-07BnCd2XBBpNa8LPHXh91kdc1MWgi8vFTRdq-Cg"
 }
