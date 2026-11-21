@@ -1,7 +1,7 @@
 {
-  "version": "0.3.11",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.11/Imperio.exe",
-  "sha256": "601552159b0411360a2f9d176592ed8e6052a03530fa66bdbbad037f6b39f15b",
-  "notes": "Enjoy :D",
-  "sig": "bJUoGVkwIErkeEnCSyMI7ye2CuEywAH49e3jqMeIrJCSAcg1uamBLy4hf0nu-r4vnaLm120dKCv1xvfDvcEHDw"
+  "version": "0.3.12",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.12/Imperio.exe",
+  "sha256": "1a9ac6e7d88a19c5090367e93ab00a77f00690bfc3ddb4a7b2bacc397ef80ae6",
+  "notes": "New: choose how to connect (Tailscale or same network) and click your Tailscale computers to connect. Plus security and reliability fixes.",
+  "sig": "312wSTgbbz4KM1QaFijqaGC273HO6sIY1X9v0hzdbRRSJG5w1kAX5HzgGo7ckqclts94hxRBIVAR_DRwXZ_EBw"
 }
