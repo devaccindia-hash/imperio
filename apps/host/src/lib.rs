@@ -337,6 +337,9 @@ pub struct HostControls {
     pub regen_code: Arc<AtomicBool>,
     /// Set to make [`run_host`] return.
     pub stop: Arc<AtomicBool>,
+    /// Set to end the session in progress (the person at this computer
+    /// pressed "Disconnect"); auto-cleared. Sharing stays on for the next one.
+    pub end_session: Arc<AtomicBool>,
 }
 
 impl HostControls {
@@ -346,6 +349,7 @@ impl HostControls {
             ask_first: Arc::new(AtomicBool::new(ask_first)),
             regen_code: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
+            end_session: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -623,6 +627,7 @@ pub fn run_host(
             device_key: device_key.clone(),
             totp_secret: totp_secret.clone(),
             ask_first: controls.ask_first.load(Ordering::Relaxed),
+            end_session: controls.end_session.clone(),
         };
         match run_session(ctx, link, &socket) {
             Ok(SessionEnd::Bye) => failed_handshakes = 0,
@@ -650,6 +655,8 @@ struct SessionCtx<'a> {
     ask_first: bool,
     device_key: Arc<DeviceKey>,
     totp_secret: Arc<Option<Vec<u8>>>,
+    /// See [`HostControls::end_session`].
+    end_session: Arc<AtomicBool>,
 }
 
 /// Tailscale / CGNAT address range (100.64.0.0/10). In open mode only peers
@@ -822,6 +829,8 @@ fn deny(link: &SecureLink, reason: &str) {
 
 fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) -> anyhow::Result<SessionEnd> {
     let cfg = ctx.cfg;
+    // A "Disconnect" pressed before this session began is not about it.
+    ctx.end_session.store(false, Ordering::Relaxed);
     // Create the injector from a cheap monitor-rect lookup and start the
     // receive thread *before* the slow encoder/pipeline build, so Ping/Pong
     // (hence the RTT estimate) stays responsive from the first moment instead
@@ -1015,7 +1024,7 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                 })
                 .ok();
         }
-        stream_loop(cfg, pipeline, &injector, &link, &rx, &target_kbps, &last_feedback_us)
+        stream_loop(cfg, pipeline, &injector, &link, &rx, &target_kbps, &last_feedback_us, &ctx.end_session)
     })();
 
     authorized.store(false, Ordering::Release);
@@ -1098,6 +1107,7 @@ fn authenticate(
 /// display being reconfigured) before giving up.
 const RECAPTURE_GIVE_UP: Duration = Duration::from_secs(120);
 
+#[allow(clippy::too_many_arguments)]
 fn stream_loop(
     cfg: &Config,
     first: Pipeline,
@@ -1106,6 +1116,7 @@ fn stream_loop(
     rx: &mpsc::Receiver<Event>,
     target_kbps: &Arc<AtomicU32>,
     last_feedback_us: &Arc<AtomicU64>,
+    end_session: &AtomicBool,
 ) -> anyhow::Result<SessionEnd> {
     tracing::info!("viewer authenticated; streaming");
     link.send_control(&first.stream_info())?;
@@ -1125,6 +1136,11 @@ fn stream_loop(
     let frame_timeout = Duration::from_millis(1000 / cfg.fps.max(1) as u64 + 1);
 
     loop {
+        if end_session.swap(false, Ordering::Relaxed) {
+            tracing::info!("session ended from this computer");
+            deny(link, "The other computer ended the session.");
+            return Ok(SessionEnd::Bye);
+        }
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 Event::KeyframeRequest => force_key = true,

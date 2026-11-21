@@ -101,6 +101,14 @@ pub struct ImperioApp {
     code: String,
     trust_new: bool,
     session: Arc<Mutex<SessionState>>,
+    /// The running session window's process, and the pipe whose closing
+    /// asks it to end the session politely (see `disconnect`).
+    session_child: Arc<Mutex<Option<std::process::Child>>>,
+    session_stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    /// The user ended the current session: its exit is not an error.
+    session_cancelled: Arc<AtomicBool>,
+    /// Counts sessions, so a late clean-up never touches a newer one.
+    session_gen: Arc<std::sync::atomic::AtomicU64>,
     tab: Tab,
     copied: Option<(&'static str, Instant)>,
     first_frame_done: bool,
@@ -173,6 +181,10 @@ impl ImperioApp {
             controls: HostControls::new(cfg.require_accept),
             engine: None,
             session: Arc::new(Mutex::new(SessionState::Idle)),
+            session_child: Default::default(),
+            session_stdin: Default::default(),
+            session_cancelled: Default::default(),
+            session_gen: Default::default(),
             tab: Tab::Saved,
             copied: None,
             first_frame_done: false,
@@ -320,7 +332,7 @@ impl ImperioApp {
         // failure, the reason on stderr with a non-zero exit code.
         let exe = std::env::current_exe().unwrap_or_else(|_| "imperio.exe".into());
         let mut cmd = std::process::Command::new(exe);
-        cmd.arg("session").arg(&target);
+        cmd.arg("session").arg(&target).arg("--stdin-control");
         // The code travels in the child's environment, not on its command
         // line (which any process on this PC could read from the task list).
         cmd.env_remove(crate::SESSION_CODE_ENV);
@@ -336,10 +348,15 @@ impl ImperioApp {
         if let Some(s) = &self.cfg.server {
             cmd.arg("--server").arg(s);
         }
-        cmd.stdin(std::process::Stdio::null())
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         *session.lock().unwrap() = SessionState::Connecting;
+        let child_slot = self.session_child.clone();
+        let stdin_slot = self.session_stdin.clone();
+        let cancelled = self.session_cancelled.clone();
+        cancelled.store(false, Ordering::Relaxed);
+        self.session_gen.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
             .name("session".into())
             .spawn(move || {
@@ -360,12 +377,34 @@ impl ImperioApp {
                             }
                         });
                     }
+                    let stderr = child.stderr.take();
+                    *stdin_slot.lock().unwrap() = child.stdin.take();
+                    *child_slot.lock().unwrap() = Some(child);
+                    // Reading to the end returns when the child is on its way out.
                     let mut err = String::new();
-                    if let Some(mut e) = child.stderr.take() {
+                    if let Some(mut e) = stderr {
                         let _ = e.read_to_string(&mut err);
                     }
-                    let status = child.wait().map_err(|e| e.to_string())?;
-                    if status.success() {
+                    // The child stays in its slot (so Disconnect can stop it)
+                    // until it has really exited.
+                    let status = loop {
+                        let mut slot = child_slot.lock().unwrap();
+                        let done = match slot.as_mut() {
+                            Some(c) => c.try_wait().map_err(|e| e.to_string()),
+                            None => Err("the session window was lost".to_string()),
+                        };
+                        match done {
+                            Ok(None) => {}
+                            other => {
+                                *slot = None;
+                                *stdin_slot.lock().unwrap() = None;
+                                break other?.expect("exit status");
+                            }
+                        }
+                        drop(slot);
+                        std::thread::sleep(Duration::from_millis(50));
+                    };
+                    if status.success() || cancelled.load(Ordering::Relaxed) {
                         Ok(())
                     } else {
                         // The child explains itself on stderr, sometimes over
@@ -386,6 +425,29 @@ impl ImperioApp {
                     }
                 };
                 ctx.request_repaint();
+            })
+            .ok();
+    }
+
+    /// End the session this computer started (or stop trying to connect).
+    /// Closing the pipe lets the session window say goodbye to the other
+    /// side and close by itself; if it has not gone shortly after (still
+    /// connecting, or stuck), it is stopped.
+    fn disconnect(&mut self) {
+        self.session_cancelled.store(true, Ordering::Relaxed);
+        drop(self.session_stdin.lock().unwrap().take());
+        let slot = self.session_child.clone();
+        let gen = self.session_gen.clone();
+        let mine = gen.load(Ordering::Relaxed);
+        std::thread::Builder::new()
+            .name("session-stop".into())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                if gen.load(Ordering::Relaxed) == mine {
+                    if let Some(c) = slot.lock().unwrap().as_mut() {
+                        let _ = c.kill();
+                    }
+                }
             })
             .ok();
     }
@@ -677,24 +739,32 @@ impl ImperioApp {
             };
             let enter = field(ui, &mut self.target, hint, field_w, 17.0);
             let enter2 = field(ui, &mut self.code, "Code (if any)", code_w, 16.0);
+            // While a session is open (or being set up) the same button ends it.
             let label = match session {
-                SessionState::Connecting => "Connecting\u{2026}",
-                SessionState::Connected => "Session open",
+                SessionState::Connecting => "Cancel",
+                SessionState::Connected => "Disconnect",
                 _ => "Connect",
             };
             let button = egui::Button::new(RichText::new(label).size(15.0).strong().color(Color32::WHITE))
                 .fill(if busy { BUTTON } else { accent() })
+                .stroke(Stroke::new(1.0, if busy { accent() } else { Color32::TRANSPARENT }))
                 .corner_radius(CornerRadius::same(10))
                 .min_size(Vec2::new(connect_w, 46.0));
-            let clicked = ui.add_enabled(!busy, button).clicked();
-            if !busy && (clicked || enter || enter2) {
+            let clicked = ui.add(button).clicked();
+            if busy && clicked {
+                self.disconnect();
+            } else if !busy && (clicked || enter || enter2) {
                 self.connect();
             }
         });
         let line = match session {
             SessionState::Failed(e) => Some((e.clone(), ERROR)),
             SessionState::Connecting => Some(("Reaching the other computer\u{2026}".to_string(), MUTED)),
-            SessionState::Connected => Some(("The remote screen is open in its own window. F11 for full screen.".to_string(), MUTED)),
+            SessionState::Connected => Some((
+                "The remote screen is open in its own window. F11 for full screen. Close that window or press Disconnect to end."
+                    .to_string(),
+                MUTED,
+            )),
             SessionState::Idle => Some((
                 "Type the address shown on the other computer\u{2019}s Imperio window, then Connect. Encrypted end to end."
                     .to_string(),
@@ -957,6 +1027,17 @@ impl ImperioApp {
                 ui.label(RichText::new(format!("Your address:  {joined}")).size(13.0).color(TEXT));
             }
             ui.label(RichText::new(&status.status).size(12.5).color(MUTED));
+            // Someone is looking at this computer: one button to stop them.
+            if status.status.starts_with("Viewer connected") {
+                ui.add_space(4.0);
+                let stop = egui::Button::new(RichText::new("Disconnect them").size(13.5).strong().color(Color32::WHITE))
+                    .fill(accent())
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(0.0, 32.0));
+                if ui.add(stop).on_hover_text("Ends their session now. Sharing stays on for next time.").clicked() {
+                    self.controls.end_session.store(true, Ordering::Relaxed);
+                }
+            }
             if let Some(e) = host_error {
                 ui.label(RichText::new(e).size(12.5).color(ERROR));
                 ui.label(RichText::new("Is another copy of Imperio already running?").size(12.0).color(MUTED));

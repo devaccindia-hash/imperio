@@ -81,6 +81,7 @@ fn session_child(args: Vec<String>) -> anyhow::Result<()> {
         force_relay: false,
         totp: None,
         record: false,
+        end_on_stdin_close: false,
         on_connected: Some(std::sync::Arc::new(|| {
             use std::io::Write;
             println!("connected");
@@ -100,6 +101,7 @@ fn session_child(args: Vec<String>) -> anyhow::Result<()> {
             "--trust-new" => req.trust_new = true,
             "--no-input" => req.send_input = false,
             "--record" => req.record = true,
+            "--stdin-control" => req.end_on_stdin_close = true,
             s if !s.starts_with("--") => req.target = s.to_string(),
             _ => {}
         }

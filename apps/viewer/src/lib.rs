@@ -835,6 +835,17 @@ fn diagnose(host: std::net::SocketAddr) -> String {
         _ => true, // can't tell; don't blame the network
     };
 
+    // A Tailscale address is reached through Tailscale, whatever Wi-Fi each
+    // computer is on: comparing it with our Wi-Fi address would blame the
+    // wrong thing.
+    if matches!(host.ip(), IpAddr::V4(h) if is_vpn(h)) {
+        return format!(
+            "Could not reach {} over Tailscale. On that computer: make sure Tailscale says Connected, \
+             Imperio is open, and sharing is on. On this computer: make sure Tailscale says Connected too.\n",
+            host.ip()
+        );
+    }
+
     let mut msg = match my_ip {
         Some(ip) => format!("Could not reach {} (this computer is {ip}). ", host.ip()),
         None => format!("Could not reach {}. ", host.ip()),
@@ -868,6 +879,9 @@ pub struct SessionRequest {
     pub on_connected: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Start recording to Videos\Imperio as soon as the stream arrives.
     pub record: bool,
+    /// End the session when standard input closes. The home window holds the
+    /// other end of that pipe: its Disconnect button (or its exit) closes it.
+    pub end_on_stdin_close: bool,
 }
 
 /// Command-line entry: parse flags, ask through the connect dialog when no
@@ -908,6 +922,7 @@ pub fn cli_main(raw: Vec<String>) -> anyhow::Result<()> {
             totp: args.totp.clone(),
             on_connected: None,
             record: false,
+            end_on_stdin_close: false,
         };
         match run_session(req) {
             Ok(()) => return Ok(()),
@@ -977,6 +992,21 @@ pub fn run_session(req: SessionRequest) -> anyhow::Result<()> {
     ui::set_command_sink(move |cmd| {
         let _ = menu_proxy.send_event(Net::Ui(cmd));
     });
+
+    if req.end_on_stdin_close {
+        let proxy = event_loop.create_proxy();
+        std::thread::Builder::new()
+            .name("stdin-watch".into())
+            .spawn(move || {
+                use std::io::Read;
+                // Blocks until the pipe closes; whatever arrives is ignored.
+                let mut sink = [0u8; 64];
+                let mut stdin = std::io::stdin();
+                while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+                let _ = proxy.send_event(Net::Ui(ui::UiCmd::Disconnect));
+            })
+            .ok();
+    }
 
     // Clipboard: viewer -> host on local change (only when input is enabled).
     let clipboard = if args.send_input {
