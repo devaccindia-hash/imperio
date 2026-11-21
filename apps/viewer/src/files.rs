@@ -70,6 +70,11 @@ struct Shared {
     /// result is shown in a message box instead.
     announce: Mutex<Vec<u32>>,
     clip: Mutex<ClipState>,
+    /// What a drag that left the session window is carrying, once the other
+    /// computer has said (see `FileBridge::drag_begin`).
+    drag_items: Mutex<Vec<String>>,
+    /// Transfers started by a drag out of the window that have not ended.
+    busy: Mutex<Vec<u32>>,
     next_xfer: AtomicU32,
 }
 
@@ -176,6 +181,8 @@ impl FileBridge {
             welcome: Mutex::new(None),
             announce: Mutex::new(Vec::new()),
             clip: Mutex::new(ClipState::default()),
+            drag_items: Mutex::new(Vec::new()),
+            busy: Mutex::new(Vec::new()),
             next_xfer: AtomicU32::new(SESSION_XFER_BASE),
         });
         let sh = shared.clone();
@@ -187,9 +194,14 @@ impl FileBridge {
                         Some(Welcome { allowed: *allowed, computer: computer.clone(), desktop: desktop.clone() });
                 }
                 Event::RemoteClip { files, bytes } => sh.remote_clip(files, *bytes),
+                Event::DragItems { paths } => {
+                    tracing::info!(count = paths.len(), "the drag on the other computer carries files");
+                    *sh.drag_items.lock().unwrap() = paths.clone();
+                }
                 Event::Finished { xfer, error, files, bytes } => {
                     tracing::info!(xfer, files, bytes, error = error.as_deref().unwrap_or("none"), "file transfer finished");
                     sh.clip_finished(*xfer, error.is_none());
+                    sh.busy.lock().unwrap().retain(|x| x != xfer);
                     let mut announce = sh.announce.lock().unwrap();
                     if let Some(i) = announce.iter().position(|x| x == xfer) {
                         announce.swap_remove(i);
@@ -243,7 +255,7 @@ impl FileBridge {
             many => format!("Paste: {} items", many.len()),
         };
         tracing::info!(count = files.len(), "sending copied files to the other computer's clipboard");
-        self.shared.to_window(&UiEvent::Started { xfer, label: label.clone(), dest: String::new() });
+        self.shared.to_window(&UiEvent::Started { xfer, label: label.clone(), dest: String::new(), upload: true });
         self.peer.upload_to_clipboard(xfer, files);
         // A paste that takes a while should be seen to be working.
         if self.has_window {
@@ -254,7 +266,7 @@ impl FileBridge {
                 let open = me.shared.window.lock().unwrap().is_some();
                 if still && !open {
                     me.open_window();
-                    me.shared.to_window(&UiEvent::Started { xfer, label, dest: String::new() });
+                    me.shared.to_window(&UiEvent::Started { xfer, label, dest: String::new(), upload: true });
                 }
             });
         }
@@ -360,11 +372,69 @@ impl FileBridge {
         tracing::info!(count = paths.len(), dest = %welcome.desktop, "sending dropped files");
         if self.has_window {
             self.open_window();
-            self.shared.to_window(&UiEvent::Started { xfer, label, dest: welcome.desktop.clone() });
+            self.shared.to_window(&UiEvent::Started { xfer, label, dest: welcome.desktop.clone(), upload: true });
         } else {
             self.shared.announce.lock().unwrap().push(xfer);
         }
         self.peer.upload(xfer, paths, welcome.desktop);
+    }
+
+    /// The pointer left the session window with the button held: a drag on
+    /// the other computer may be carrying files. Ask which.
+    pub fn drag_begin(&self) {
+        self.shared.drag_items.lock().unwrap().clear();
+        if self.send_input && self.shared.welcome.lock().unwrap().as_ref().is_some_and(|w| w.allowed) {
+            self.peer.drag_query();
+        }
+    }
+
+    /// The other computer has answered that the drag carries files.
+    pub fn drag_has_files(&self) -> bool {
+        !self.shared.drag_items.lock().unwrap().is_empty()
+    }
+
+    /// The pointer came back into the window: the drag goes on over there.
+    pub fn drag_cancel(&self) {
+        self.shared.drag_items.lock().unwrap().clear();
+    }
+
+    /// The button was released outside the session window, at screen point
+    /// (`x`, `y`). If the drag carried files, they are brought to the folder
+    /// under the pointer (the Desktop or an open Explorer window). Returns
+    /// true when the drag carried files, in which case the caller cancels the
+    /// drag on the other computer instead of letting it drop there.
+    pub fn drop_out(self: &Arc<Self>, x: i32, y: i32) -> bool {
+        let items = std::mem::take(&mut *self.shared.drag_items.lock().unwrap());
+        if items.is_empty() {
+            return false;
+        }
+        let Some(folder) = imperio_files::shell::folder_at(x, y) else {
+            tracing::info!("files were dragged out, but not onto the Desktop or a folder window");
+            return true;
+        };
+        let xfer = self.shared.xfer();
+        let label = match items.as_slice() {
+            [one] => one.rsplit(['\\', '/']).next().unwrap_or(one).to_string(),
+            many => format!("{} items", many.len()),
+        };
+        tracing::info!(count = items.len(), dest = %folder.display(), "bringing dragged files here");
+        let dest = folder.to_string_lossy().into_owned();
+        self.shared.to_window(&UiEvent::Started { xfer, label: label.clone(), dest: dest.clone(), upload: false });
+        self.peer.download(xfer, items, folder);
+        // Something large should be seen to be on its way.
+        if self.has_window {
+            let me = self.clone();
+            let _ = std::thread::Builder::new().spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let open = me.shared.window.lock().unwrap().is_some();
+                if !open && me.shared.busy.lock().unwrap().contains(&xfer) {
+                    me.open_window();
+                    me.shared.to_window(&UiEvent::Started { xfer, label, dest, upload: false });
+                }
+            });
+        }
+        self.shared.busy.lock().unwrap().push(xfer);
+        true
     }
 
     /// Command-line transfers (`--push`, `--pull`): run them once the other

@@ -24,6 +24,13 @@ pub struct Renderer {
     source: Option<(u32, u32)>,
     converter: Option<Converter>,
     dest: RECT,
+    /// The part of the source picture shown (all of it unless zoomed in).
+    src: RECT,
+    cropped: bool,
+    zoom: Option<f64>,
+    pan: (f64, f64),
+    /// The picture last drawn, to draw again after a zoom or pan change.
+    last: Option<(ID3D11Texture2D, u32)>,
 }
 
 impl Renderer {
@@ -64,8 +71,13 @@ impl Renderer {
             source: None,
             converter: None,
             dest: RECT::default(),
+            src: RECT::default(),
+            cropped: false,
+            zoom: None,
+            pan: (0.5, 0.5),
+            last: None,
         };
-        r.recompute();
+        r.rebuild();
         Ok(r)
     }
 
@@ -73,13 +85,9 @@ impl Renderer {
         &self.dev
     }
 
-    pub fn dest_rect(&self) -> RECT {
-        self.dest
-    }
-
     pub fn set_source_size(&mut self, w: u32, h: u32) {
         self.source = Some((w, h));
-        self.recompute();
+        self.rebuild();
     }
 
     pub fn resize(&mut self, w: u32, h: u32) -> anyhow::Result<()> {
@@ -94,30 +102,99 @@ impl Renderer {
                 .ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))
         }
         .context("ResizeBuffers")?;
-        self.recompute();
+        self.rebuild();
+        self.redraw();
         Ok(())
     }
 
-    /// Rebuild the converter and letterbox rect for the current sizes.
-    fn recompute(&mut self) {
+    /// Zoom: `None` fits the whole picture in the window; `Some(f)` shows
+    /// `f` window pixels per pixel of the other screen (1.0 = actual size).
+    pub fn set_zoom(&mut self, zoom: Option<f64>) {
+        self.zoom = zoom;
+        self.layout();
+        self.redraw();
+    }
+
+    pub fn zoom(&self) -> Option<f64> {
+        self.zoom
+    }
+
+    /// Window pixels per pixel of the other screen, as shown right now.
+    pub fn scale(&self) -> f64 {
+        let Some((sw, sh)) = self.source else { return 1.0 };
+        self.zoom.unwrap_or_else(|| (self.width as f64 / sw as f64).min(self.height as f64 / sh as f64))
+    }
+
+    /// When the picture is larger than the window, the part shown follows
+    /// the pointer: `fx`, `fy` are its position across the window, 0..=1.
+    pub fn set_pan(&mut self, fx: f64, fy: f64) {
+        let pan = (fx.clamp(0.0, 1.0), fy.clamp(0.0, 1.0));
+        if self.cropped && pan != self.pan {
+            self.pan = pan;
+            self.layout();
+            self.redraw();
+        } else {
+            self.pan = pan;
+        }
+    }
+
+    /// A window position as a position on the other screen, 0..=1 each way.
+    pub fn to_source(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (sw, sh) = self.source?;
+        let (d, s) = (self.dest, self.src);
+        let fx = (x - d.left as f64) / (d.right - d.left).max(1) as f64;
+        let fy = (y - d.top as f64) / (d.bottom - d.top).max(1) as f64;
+        let px = s.left as f64 + fx.clamp(0.0, 1.0) * (s.right - s.left) as f64;
+        let py = s.top as f64 + fy.clamp(0.0, 1.0) * (s.bottom - s.top) as f64;
+        Some(((px / sw as f64).clamp(0.0, 1.0), (py / sh as f64).clamp(0.0, 1.0)))
+    }
+
+    /// New converter for the current sizes, then the layout.
+    fn rebuild(&mut self) {
         let Some((sw, sh)) = self.source else { return };
-        let scale = (self.width as f64 / sw as f64).min(self.height as f64 / sh as f64);
-        let dw = (sw as f64 * scale).round() as i32;
-        let dh = (sh as f64 * scale).round() as i32;
-        let left = (self.width as i32 - dw) / 2;
-        let top = (self.height as i32 - dh) / 2;
-        self.dest = RECT {
-            left,
-            top,
-            right: left + dw,
-            bottom: top + dh,
-        };
         match Converter::new(&self.dev, sw, sh, self.width, self.height, false) {
-            Ok(c) => {
-                c.set_dest_rect(Some(self.dest));
-                self.converter = Some(c);
-            }
+            Ok(c) => self.converter = Some(c),
             Err(e) => tracing::error!(error = %e, "video processor init failed"),
+        }
+        self.layout();
+    }
+
+    /// Which part of the picture goes where in the window.
+    fn layout(&mut self) {
+        let Some((sw, sh)) = self.source else { return };
+        let (ww, wh) = (self.width as f64, self.height as f64);
+        let scale = self.scale();
+        // One axis at a time: what fits is centred, what does not is cropped
+        // to the window and positioned by the pan.
+        let axis = |source: f64, window: f64, pan: f64| -> (f64, f64, f64, f64) {
+            let shown = source * scale;
+            if shown <= window + 0.5 {
+                let start = ((window - shown) / 2.0).round();
+                (0.0, source, start, start + shown.round())
+            } else {
+                let visible = window / scale;
+                let from = ((source - visible) * pan).round();
+                (from, from + visible, 0.0, window)
+            }
+        };
+        let (sx0, sx1, dx0, dx1) = axis(sw as f64, ww, self.pan.0);
+        let (sy0, sy1, dy0, dy1) = axis(sh as f64, wh, self.pan.1);
+        self.src = RECT { left: sx0 as i32, top: sy0 as i32, right: (sx1.round() as i32).min(sw as i32), bottom: (sy1.round() as i32).min(sh as i32) };
+        self.dest = RECT { left: dx0 as i32, top: dy0 as i32, right: dx1 as i32, bottom: dy1 as i32 };
+        self.cropped = self.src.right - self.src.left < sw as i32 || self.src.bottom - self.src.top < sh as i32;
+        if let Some(c) = &self.converter {
+            c.set_source_rect(self.cropped.then_some(self.src));
+            c.set_dest_rect(Some(self.dest));
+        }
+    }
+
+    /// Draw the last picture again (after a zoom or pan change; the other
+    /// screen may not change for a while).
+    fn redraw(&mut self) {
+        if let Some((tex, sub)) = self.last.clone() {
+            if let Err(e) = self.present(&tex, sub) {
+                tracing::debug!(error = %e, "redraw failed");
+            }
         }
     }
 
@@ -132,6 +209,7 @@ impl Renderer {
         unsafe { self.swapchain.Present(0, DXGI_PRESENT(0)) }
             .ok()
             .context("Present")?;
+        self.last = Some((nv12.clone(), subresource));
         Ok(())
     }
 }

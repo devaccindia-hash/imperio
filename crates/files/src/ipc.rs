@@ -35,7 +35,7 @@ pub enum UiCmd {
 pub enum UiEvent {
     Engine(Event),
     /// The session window started an upload on its own (a drop on the picture).
-    Started { xfer: u32, label: String, dest: String },
+    Started { xfer: u32, label: String, dest: String, upload: bool },
     /// Bring the Files window to the front.
     Focus,
 }

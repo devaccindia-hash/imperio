@@ -86,6 +86,10 @@ pub enum Msg {
     /// The viewed computer's clipboard changed; `files` are the copied
     /// files, if any (`bytes`: their size, `u64::MAX` if too many to count).
     Clip { files: Vec<String>, bytes: u64 },
+    /// "A drag just began on your screen: which files is it carrying?"
+    DragQuery,
+    /// The files selected in the window in front of the viewed computer.
+    DragItems { paths: Vec<String> },
 }
 
 pub fn encode(msg: &Msg) -> Vec<u8> {

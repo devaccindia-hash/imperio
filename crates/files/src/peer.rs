@@ -50,6 +50,9 @@ pub enum Event {
     /// there, if it was files (`bytes` is their size, `u64::MAX` when too
     /// many to count).
     RemoteClip { files: Vec<String>, bytes: u64 },
+    /// Answer to [`Peer::drag_query`]: what a drag on the other computer's
+    /// screen is carrying (empty when it is not files).
+    DragItems { paths: Vec<String> },
 }
 
 type Events = Box<dyn Fn(Event) + Send + Sync>;
@@ -175,6 +178,11 @@ impl Peer {
             self.inner.incoming.lock().unwrap().remove(&xfer);
             self.inner.finished(xfer, Some("The connection is closed.".into()), 0, 0);
         }
+    }
+
+    /// Ask which files the drag that just began on the other screen carries.
+    pub fn drag_query(&self) {
+        self.inner.send(&Msg::DragQuery);
     }
 
     /// Send local `paths` to the other computer's clipboard, ready to paste.
@@ -450,6 +458,20 @@ impl Inner {
             }
             Msg::OpDone { id, error } if !self.is_host() => self.emit(Event::OpDone { id, error }),
             Msg::Clip { files, bytes } if !self.is_host() => self.emit(Event::RemoteClip { files, bytes }),
+            Msg::DragItems { paths } if !self.is_host() => self.emit(Event::DragItems { paths }),
+            Msg::DragQuery if self.is_host() => {
+                if self.host_allows() {
+                    let me = self.clone();
+                    spawn("files-drag", move || {
+                        let paths: Vec<String> = crate::shell::selected_in_foreground()
+                            .iter()
+                            .filter(|p| !clip::in_staging(p))
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect();
+                        me.send(&Msg::DragItems { paths });
+                    });
+                }
+            }
 
             // ---- a transfer this side is receiving -----------------------
             Msg::Total { xfer, files, bytes } => self.receive(xfer, |inc| {

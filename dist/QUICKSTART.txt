@@ -35,7 +35,12 @@ Copy this WHOLE folder to BOTH PCs.
   files or folders from one side to the other, or use the Send / Bring
   buttons. Right-click for rename, copy, move, new folder and delete (to the
   Recycle Bin). You can also drop files straight onto the remote picture:
-  they go to the other computer's Desktop. Copy and paste works across the
+  they go to the other computer's Desktop. The other way round works too:
+  take hold of a file you see on the other computer, drag it out of the
+  remote-screen window and let go over your own Desktop or an open folder
+  window. (Both computers need 0.3.17 or newer for that.) To see small text,
+  use the View menu: zoom in, and the view follows your pointer.
+  Copy and paste works across the
   two computers as well: copy files here and press Ctrl+V in the remote-screen
   window, or copy files there (up to 200 MB) and paste them here once they
   have arrived. Both computers need 0.3.16 or

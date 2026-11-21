@@ -354,8 +354,8 @@ impl FilesApp {
             }
             In::LocalOp { id, error } => self.op_done(id, error),
             In::Ui(UiEvent::Focus) => self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
-            In::Ui(UiEvent::Started { xfer, label, dest }) => {
-                self.transfers.push(Transfer::new(xfer, label, true, dest));
+            In::Ui(UiEvent::Started { xfer, label, dest, upload }) => {
+                self.transfers.push(Transfer::new(xfer, label, upload, dest));
             }
             In::Ui(UiEvent::Engine(ev)) => match ev {
                 Event::Welcome { allowed, computer, desktop, .. } => {
@@ -371,7 +371,7 @@ impl FilesApp {
                 }
                 Event::Listing { id, path, parent, entries, error } => self.listing(true, id, path, parent, entries, error),
                 Event::OpDone { id, error } => self.op_done(id, error),
-                Event::RemoteClip { .. } => {}
+                Event::RemoteClip { .. } | Event::DragItems { .. } => {}
                 Event::Progress { xfer, name, files_done, files_total, bytes_done, bytes_total } => {
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.xfer == xfer) {
                         t.name = name;

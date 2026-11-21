@@ -14,6 +14,7 @@ pub mod ipc;
 pub mod ops;
 pub mod peer;
 pub mod proto;
+pub mod shell;
 
 pub use peer::{Event, Peer, Role};
 pub use proto::{Entry, Op};

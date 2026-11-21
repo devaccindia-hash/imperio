@@ -502,6 +502,17 @@ impl Converter {
         })
     }
 
+    /// Show only this part of the source picture (zoom); `None` = all of it.
+    pub fn set_source_rect(&self, rect: Option<RECT>) {
+        // SAFETY: valid processor; the rect is copied by the call.
+        unsafe {
+            match rect {
+                Some(r) => self.dev.video_context.VideoProcessorSetStreamSourceRect(&self.processor, 0, true, Some(&r)),
+                None => self.dev.video_context.VideoProcessorSetStreamSourceRect(&self.processor, 0, false, None),
+            }
+        }
+    }
+
     /// Restrict output to `rect` (letterboxing); `None` fills the target.
     pub fn set_dest_rect(&self, rect: Option<RECT>) {
         unsafe {

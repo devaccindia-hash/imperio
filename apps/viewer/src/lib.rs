@@ -131,6 +131,10 @@ struct App {
     /// The V of a Ctrl+V that was taken over to send files: its release is
     /// not passed on either.
     swallow_v: bool,
+    /// The left button is held (pressed inside the window).
+    left_down: bool,
+    /// The pointer has left the window with the button held.
+    dragging_out: bool,
     menu: Option<ui::SessionMenu>,
     fullscreen: bool,
     /// Recording wanted; the recorder is created at the first keyframe once
@@ -258,13 +262,35 @@ impl App {
 
     fn normalised_cursor(&self) -> Option<(u16, u16)> {
         let (x, y) = self.cursor?;
-        let r = self.renderer.as_ref()?;
-        let dest = r.dest_rect();
-        let w = (dest.right - dest.left).max(1) as f64;
-        let h = (dest.bottom - dest.top).max(1) as f64;
-        let nx = ((x - dest.left as f64) / w).clamp(0.0, 1.0);
-        let ny = ((y - dest.top as f64) / h).clamp(0.0, 1.0);
+        let (nx, ny) = self.renderer.as_ref()?.to_source(x, y)?;
         Some(((nx * 65535.0) as u16, (ny * 65535.0) as u16))
+    }
+
+    /// View menu / Ctrl+Shift+Plus, Minus, 0.
+    fn zoom(&mut self, change: ui::Zoom) {
+        const STEPS: [f64; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0];
+        let Some(r) = self.renderer.as_mut() else { return };
+        let fit = {
+            let before = r.zoom();
+            r.set_zoom(None);
+            let fit = r.scale();
+            r.set_zoom(before);
+            fit
+        };
+        let now = r.scale();
+        let next = match change {
+            ui::Zoom::Fit => None,
+            ui::Zoom::Percent(p) => Some(p as f64 / 100.0),
+            ui::Zoom::In => Some(STEPS.iter().copied().find(|s| *s > now + 0.01).unwrap_or(now)),
+            // Zooming out stops at "fit": smaller than that only wastes the window.
+            ui::Zoom::Out => STEPS.iter().rev().copied().find(|s| *s < now - 0.01).filter(|s| *s > fit + 0.01),
+        };
+        r.set_zoom(next);
+        let percent = next.map(|z| (z * 100.0).round() as u16);
+        tracing::info!(zoom = ?percent, "zoom changed");
+        if let Some(m) = &self.menu {
+            m.set_zoom(percent);
+        }
     }
 
     fn handle_frame(&mut self, f: CompleteFrame) -> anyhow::Result<()> {
@@ -412,6 +438,7 @@ impl ApplicationHandler<Net> for App {
                 }
                 ui::UiCmd::ToggleRecording => self.toggle_recording(),
                 ui::UiCmd::Files => self.files.open_window(),
+                ui::UiCmd::Zoom(z) => self.zoom(z),
                 ui::UiCmd::Dropped(paths) => self.files.send_dropped(paths),
                 ui::UiCmd::About => imperio_ui::info_box("Imperio viewer", &ui::about_text()),
             },
@@ -437,6 +464,38 @@ impl ApplicationHandler<Net> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some((position.x, position.y));
+                // Zoomed in: the part of the picture shown follows the pointer.
+                if let (Some(w), Some(r)) = (&self.window, self.renderer.as_mut()) {
+                    let size = w.inner_size();
+                    r.set_pan(position.x / size.width.max(1) as f64, position.y / size.height.max(1) as f64);
+                }
+                // Dragging out of the window: when the pointer leaves with
+                // the button held, the other computer is asked whether that
+                // drag carries files. If it does, the pointer over there
+                // stays put, and letting go over the Desktop or a folder
+                // here brings the files (see the button release below).
+                if self.left_down && self.send_input {
+                    let outside = self.window.as_ref().is_some_and(|w| {
+                        let size = w.inner_size();
+                        position.x < 0.0 || position.y < 0.0 || position.x >= size.width as f64 || position.y >= size.height as f64
+                    });
+                    if outside && !self.dragging_out {
+                        self.dragging_out = true;
+                        self.files.drag_begin();
+                    } else if !outside && self.dragging_out {
+                        self.dragging_out = false;
+                        self.files.drag_cancel();
+                        if let Some(w) = &self.window {
+                            w.set_cursor(winit::window::CursorIcon::Default);
+                        }
+                    }
+                    if self.dragging_out && self.files.drag_has_files() {
+                        if let Some(w) = &self.window {
+                            w.set_cursor(winit::window::CursorIcon::Copy);
+                        }
+                        return;
+                    }
+                }
                 if let Some((nx, ny)) = self.normalised_cursor() {
                     self.send(ControlMessage::Input(InputEvent::MouseMove { nx, ny }));
                 }
@@ -450,6 +509,31 @@ impl ApplicationHandler<Net> for App {
                     winit::event::MouseButton::Forward => MouseButton::X2,
                     winit::event::MouseButton::Other(_) => return,
                 };
+                if button == MouseButton::Left {
+                    self.left_down = state == ElementState::Pressed;
+                    if !self.left_down && self.dragging_out {
+                        self.dragging_out = false;
+                        if let Some(w) = &self.window {
+                            w.set_cursor(winit::window::CursorIcon::Default);
+                        }
+                        let mut at = windows::Win32::Foundation::POINT::default();
+                        // SAFETY: plain call with a valid out pointer.
+                        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
+                        if self.files.drop_out(at.x, at.y) {
+                            // The files come here; over there the drag is
+                            // called off (Esc) rather than dropped wherever
+                            // the pointer was left.
+                            for down in [true, false] {
+                                self.send(ControlMessage::Input(InputEvent::Key {
+                                    scancode: 0x01,
+                                    extended: false,
+                                    down,
+                                    unicode: None,
+                                }));
+                            }
+                        }
+                    }
+                }
                 self.send(ControlMessage::Input(InputEvent::MouseButton {
                     button,
                     down: state == ElementState::Pressed,
@@ -476,6 +560,19 @@ impl ApplicationHandler<Net> for App {
                 if down && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F11) {
                     self.toggle_fullscreen();
                     return;
+                }
+                // Local shortcuts: Ctrl+Shift+Plus / Minus / 0 zoom the view.
+                if down && self.ctrl && self.shift {
+                    let change = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => Some(ui::Zoom::In),
+                        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => Some(ui::Zoom::Out),
+                        PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0) => Some(ui::Zoom::Fit),
+                        _ => None,
+                    };
+                    if let Some(change) = change {
+                        self.zoom(change);
+                        return;
+                    }
                 }
                 // Local shortcut: Ctrl+Shift+<digit> selects a host display.
                 // Not forwarded to the host.
@@ -1175,6 +1272,8 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
         clipboard,
         files: files.clone(),
         swallow_v: false,
+        left_down: false,
+        dragging_out: false,
         window: None,
         renderer: None,
         decoder: None,

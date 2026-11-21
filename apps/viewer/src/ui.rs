@@ -14,9 +14,9 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, SetWindowSubclass, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuRadioItem, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, ModifyMenuW,
+    AppendMenuW, CheckMenuItem, CheckMenuRadioItem, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, ModifyMenuW,
     SetMenu, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, DM_GETDEFID, ES_AUTOHSCROLL, HMENU, IDCANCEL,
-    IDOK, MF_BYCOMMAND, MF_BYPOSITION, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, WM_CLOSE, WM_COMMAND,
+    IDOK, MF_BYCOMMAND, MF_BYPOSITION, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, WM_CLOSE, WM_COMMAND,
     WM_DESTROY, WM_DROPFILES, WS_BORDER, WS_TABSTOP,
 };
 
@@ -183,6 +183,7 @@ pub enum UiCmd {
     Files,
     /// Files or folders were dropped on the picture.
     Dropped(Vec<std::path::PathBuf>),
+    Zoom(Zoom),
     Disconnect,
     ToggleFullscreen,
     SelectDisplay(u8),
@@ -194,6 +195,21 @@ const ID_DISCONNECT: u16 = 1001;
 const ID_FULLSCREEN: u16 = 1002;
 const ID_RECORD: u16 = 1003;
 const ID_FILES: u16 = 1004;
+const ID_ZOOM_IN: u16 = 1301;
+const ID_ZOOM_OUT: u16 = 1302;
+/// "Fit to window", followed by one id per entry of [`ZOOM_PERCENTS`].
+const ID_ZOOM_FIT: u16 = 1310;
+/// The fixed zoom levels of the View menu.
+pub const ZOOM_PERCENTS: [u16; 6] = [75, 100, 125, 150, 200, 300];
+
+/// A change of zoom asked for from the menu or the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    Fit,
+    Percent(u16),
+    In,
+    Out,
+}
 const ID_ABOUT: u16 = 1200;
 const ID_DISPLAY_BASE: u16 = 1100;
 const SUBCLASS_ID: usize = 0x1A9E;
@@ -224,6 +240,7 @@ pub struct SessionMenu {
     bar: HMENU,
     session: HMENU,
     displays: HMENU,
+    view: HMENU,
 }
 
 impl SessionMenu {
@@ -232,7 +249,7 @@ impl SessionMenu {
     pub fn attach(hwnd: HWND) -> Option<Self> {
         // SAFETY: hwnd is the live winit window on this thread; menus created
         // here are owned by the window once SetMenu succeeds.
-        let (bar, displays, session) = unsafe {
+        let (bar, displays, session, view) = unsafe {
             let bar = CreateMenu().ok()?;
             let session = CreatePopupMenu().ok()?;
             AppendMenuW(session, MF_STRING, ID_FULLSCREEN as usize, &HSTRING::from("Full screen\tF11")).ok()?;
@@ -258,19 +275,40 @@ impl SessionMenu {
                 &HSTRING::from("Tip: copy files on your computer, then press Ctrl+V here to paste them there"),
             )
             .ok()?;
+            AppendMenuW(
+                files,
+                MF_STRING | MF_GRAYED,
+                0,
+                &HSTRING::from("Tip: drag a file out of this window onto your Desktop or a folder to bring it here"),
+            )
+            .ok()?;
             let help = CreatePopupMenu().ok()?;
             AppendMenuW(help, MF_STRING, ID_ABOUT as usize, &HSTRING::from("Shortcuts && about")).ok()?;
             AppendMenuW(bar, MF_POPUP, session.0 as usize, &HSTRING::from("Session")).ok()?;
             AppendMenuW(bar, MF_POPUP, displays.0 as usize, &HSTRING::from("Display")).ok()?;
+            let view = CreatePopupMenu().ok()?;
+            AppendMenuW(view, MF_STRING, ID_ZOOM_FIT as usize, &HSTRING::from("Fit to window	Ctrl+Shift+0")).ok()?;
+            for (i, p) in ZOOM_PERCENTS.iter().enumerate() {
+                let label = if *p == 100 { "Actual size (100%)".to_string() } else { format!("{p}%") };
+                AppendMenuW(view, MF_STRING, ID_ZOOM_FIT as usize + 1 + i, &HSTRING::from(label)).ok()?;
+            }
+            AppendMenuW(view, MF_SEPARATOR, 0, None).ok()?;
+            AppendMenuW(view, MF_STRING, ID_ZOOM_IN as usize, &HSTRING::from("Zoom in	Ctrl+Shift+Plus")).ok()?;
+            AppendMenuW(view, MF_STRING, ID_ZOOM_OUT as usize, &HSTRING::from("Zoom out	Ctrl+Shift+Minus")).ok()?;
+            AppendMenuW(view, MF_SEPARATOR, 0, None).ok()?;
+            AppendMenuW(view, MF_STRING | MF_GRAYED, 0, &HSTRING::from("When zoomed in, the view follows the pointer")).ok()?;
+            AppendMenuW(bar, MF_POPUP, view.0 as usize, &HSTRING::from("View")).ok()?;
             AppendMenuW(bar, MF_POPUP, files.0 as usize, &HSTRING::from("Files")).ok()?;
             AppendMenuW(bar, MF_POPUP, help.0 as usize, &HSTRING::from("Help")).ok()?;
             SetMenu(hwnd, Some(bar)).ok()?;
             let _ = DrawMenuBar(hwnd);
             SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0).ok().ok()?;
             DragAcceptFiles(hwnd, true);
-            (bar, displays, session)
+            (bar, displays, session, view)
         };
-        Some(Self { hwnd, bar, session, displays })
+        let menu = Self { hwnd, bar, session, displays, view };
+        menu.set_zoom(None);
+        Some(menu)
     }
 
     /// Rebuild the Display submenu for `count` displays with `current` checked.
@@ -302,6 +340,29 @@ impl SessionMenu {
                 &HSTRING::from(label),
             );
             let _ = DrawMenuBar(self.hwnd);
+        }
+    }
+
+    /// Tick the current zoom in the View menu: `None` = fit to window,
+    /// otherwise a percentage (only the listed ones get a tick).
+    pub fn set_zoom(&self, percent: Option<u16>) {
+        let item = match percent {
+            None => ID_ZOOM_FIT as u32,
+            Some(p) => match ZOOM_PERCENTS.iter().position(|z| *z == p) {
+                Some(i) => ID_ZOOM_FIT as u32 + 1 + i as u32,
+                None => 0,
+            },
+        };
+        let last = ID_ZOOM_FIT as u32 + ZOOM_PERCENTS.len() as u32;
+        // SAFETY: live menu owned by our window, used on its thread.
+        unsafe {
+            if item == 0 {
+                for id in ID_ZOOM_FIT as u32..=last {
+                    let _ = CheckMenuItem(self.view, id, MF_BYCOMMAND.0 | MF_UNCHECKED.0);
+                }
+            } else {
+                let _ = CheckMenuRadioItem(self.view, ID_ZOOM_FIT as u32, last, item, MF_BYCOMMAND.0);
+            }
         }
     }
 
@@ -347,6 +408,12 @@ unsafe extern "system" fn subclass_proc(
             ID_FULLSCREEN => Some(UiCmd::ToggleFullscreen),
             ID_RECORD => Some(UiCmd::ToggleRecording),
             ID_FILES => Some(UiCmd::Files),
+            ID_ZOOM_IN => Some(UiCmd::Zoom(Zoom::In)),
+            ID_ZOOM_OUT => Some(UiCmd::Zoom(Zoom::Out)),
+            ID_ZOOM_FIT => Some(UiCmd::Zoom(Zoom::Fit)),
+            n if (ID_ZOOM_FIT + 1..=ID_ZOOM_FIT + ZOOM_PERCENTS.len() as u16).contains(&n) => {
+                Some(UiCmd::Zoom(Zoom::Percent(ZOOM_PERCENTS[(n - ID_ZOOM_FIT - 1) as usize])))
+            }
             ID_ABOUT => Some(UiCmd::About),
             n if (ID_DISPLAY_BASE..ID_DISPLAY_BASE + 16).contains(&n) => {
                 Some(UiCmd::SelectDisplay((n - ID_DISPLAY_BASE) as u8))
@@ -366,10 +433,12 @@ pub fn about_text() -> String {
     format!(
         "Imperio viewer {}\n\n\
          F11 \u{2014} toggle full screen\n\
+         Ctrl+Shift+Plus / Minus \u{2014} zoom in / out; Ctrl+Shift+0 \u{2014} fit to window (also in the View menu)\n\
          Ctrl+Shift+1..9 \u{2014} switch the host display\n\
          Session > Start recording saves the session as an MP4 in Videos\\Imperio.\n\
          Files > Browse and transfer files opens both computers side by side.\n\
          Drop files on this window to send them to the other computer\u{2019}s Desktop.\n\
+         Drag a file out of this window onto your Desktop or a folder to bring it here.\n\
          Copied files cross too: copy here and press Ctrl+V in this window, or copy there and paste here.\n\
          Close the window or use Session > Disconnect to end the session.\n\n\
          All traffic is end-to-end encrypted; the host identity is pinned on first use.\n\n\

@@ -49,14 +49,17 @@ packet loss: 0 dropped frames.
 
 Windows integration (Phase 4): `C:\ProgramData\Imperio\config.toml`; host
 cursor drawn into the stream; multi-monitor with viewer-side switching
-(Ctrl+Shift+1..N); two-way clipboard text sync; unattended password or
+(Ctrl+Shift+1..N); zoom (View menu, Ctrl+Shift+Plus / Minus / 0; when
+zoomed in the view follows the pointer); two-way clipboard text sync; unattended password or
 rotating session code; a Windows service wrapper (`install-service`) that
 runs a streaming helper in the active console session and follows the input
 desktop for UAC / lock screen.
 
 Files: a Files window in the session (Files > Browse and transfer files) shows
 both computers side by side. Drag between the sides, or drop files on the
-remote picture to send them to the other Desktop; right-click for rename,
+remote picture to send them to the other Desktop, and drag a file you see on
+the other computer out of the picture onto your own Desktop or an open
+folder window to bring it here; right-click for rename,
 copy, move, new folder and delete (to the Recycle Bin). Copy and paste of
 files crosses too: copy files on your computer and press Ctrl+V in the
 session window, or copy files on the other computer (up to 200 MB) and paste
