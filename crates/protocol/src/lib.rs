@@ -87,7 +87,24 @@ pub enum ControlMessage {
         count: u16,
         data: Vec<u8>,
     },
+    /// Host tells the viewer what it understands beyond protocol version 3
+    /// (a set of `FEATURE_*` bits). Sent with every `StreamInfo`.
+    Features(u32),
+    /// Numbered input events: everything the viewer has sent and the host has
+    /// not confirmed yet, oldest first. The host applies those newer than the
+    /// last one it applied. Used once the host has sent
+    /// [`FEATURE_INPUT_BATCH`]; see `imperio_transport::input`.
+    InputBatch {
+        events: Vec<(u32, InputEvent)>,
+    },
+    /// Host confirms every input event up to and including `seq`.
+    InputAck {
+        seq: u32,
+    },
 }
+
+/// The host understands [`ControlMessage::InputBatch`].
+pub const FEATURE_INPUT_BATCH: u32 = 1;
 
 impl ControlMessage {
     pub fn encode(&self) -> Vec<u8> {

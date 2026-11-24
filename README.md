@@ -141,7 +141,17 @@ target\release\imperio-bench.exe probe-input 127.0.0.1:7700 <code> # pairs and c
 target\release\imperio-bench.exe lossy-proxy 7701 127.0.0.1:7700 5 # 5% loss proxy for NACK testing
 bash tools/bench/run-e2e-tests.sh                                 # 21 end-to-end checks, one machine
 bash tools/bench/run-phase2-tests.sh                              # loss / relay / latency scenarios
+bash tools/bench/run-weak-link-test.sh 3mbit 30 --rate-kbps 3000 --queue-ms 300 --delay-ms 20   # a slow connection
+bash tools/bench/run-keyboard-test.sh loss10 300 new --loss 10 --delay-ms 20                    # typing through loss
 ```
+
+The last two put `imperio-bench bad-link` between viewer and host: a proxy
+that behaves like a weak connection (limited capacity with a queue in front
+of it, delay, loss). The first reports how the picture, the delay and the
+ping held up; the second types through it and checks in the host's log that
+every key arrived once, in order, and none was left held down. The host runs
+with `IMPERIO_INPUT_LOG_ONLY=1` there, which writes input to the log instead
+of pressing keys on the computer.
 
 `run-e2e-tests.sh` covers pairing, wrong codes, identity pinning, TOTP, the
 authorization gate, and the signal server (direct, relay, ID binding). Both

@@ -13,6 +13,7 @@
 //!   ... --pull <path there> <local folder>   fetch one
 
 pub mod files;
+mod input;
 mod known_hosts;
 mod render;
 mod ui;
@@ -124,6 +125,8 @@ fn parse_args(raw: Vec<String>) -> anyhow::Result<Args> {
 
 struct App {
     link: Arc<SecureLink>,
+    /// Where keyboard and mouse events go out (see `input`).
+    input: Arc<input::InputLine>,
     send_input: bool,
     totp: Option<String>,
     clipboard: Option<Arc<ClipboardSync>>,
@@ -144,6 +147,10 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
     decoder: Option<Box<dyn VideoDecoder>>,
+    /// Frames arrived before there was a decoder for them (the stream
+    /// description was lost or late): the full picture among them is gone,
+    /// and another has to be asked for once the decoder exists.
+    missed_frames: bool,
     stream: Option<(u32, u32)>,
     monitor: u8,
     monitors: u8,
@@ -241,12 +248,30 @@ impl App {
     }
 
     fn send(&self, msg: ControlMessage) {
-        if !self.send_input && matches!(msg, ControlMessage::Input(_)) {
-            return;
-        }
         if let Err(e) = self.link.send_control(&msg) {
             tracing::debug!(error = %e, "send failed");
         }
+    }
+
+    /// A key, button, wheel or pointer event for the other computer.
+    fn input_event(&mut self, ev: InputEvent) {
+        self.input.send(ev);
+    }
+
+    /// Let go, on the other computer, of every key and button still held
+    /// there. When this window loses the keyboard (Alt+Tab, the Windows key,
+    /// a click elsewhere, the lock screen) the releases go to another window
+    /// and never reach us; without this, Alt, Ctrl, Shift or the Windows key
+    /// would stay down over there and turn everything typed afterwards into
+    /// shortcuts.
+    fn release_held(&mut self) {
+        let released = self.input.release_held();
+        if released > 0 {
+            tracing::info!(released, "window lost the keyboard; released what was held on the other computer");
+        }
+        self.left_down = false;
+        self.dragging_out = false;
+        self.swallow_v = false;
     }
 
     fn update_title(&self) {
@@ -297,6 +322,7 @@ impl App {
         let pts = f.timestamp_us as i64 * 10;
         self.record_frame(&f, pts);
         let (Some(dec), Some(r)) = (self.decoder.as_mut(), self.renderer.as_mut()) else {
+            self.missed_frames = true;
             return Ok(());
         };
         let t0 = Instant::now();
@@ -321,8 +347,11 @@ impl App {
                 let dec = dec_ms.as_secs_f64() * 1e3;
                 let g2g = self.latency_sum_us as f64 / self.frames as f64 / 1e3;
                 let rtt = self.link.rtt().as_secs_f64() * 1e3;
+                // Said in words too: a slow picture with a long round trip
+                // is the connection, not either computer.
+                let slow = if rtt > 150.0 { " - slow connection" } else { "" };
                 let disp = if self.monitors > 1 { format!(" [display {}/{}]", self.monitor + 1, self.monitors) } else { String::new() };
-                w.set_title(&format!("Imperio viewer{disp} - {fps:.0} fps, rtt {rtt:.1} ms, decode {dec:.1} ms, present {g2g:.1} ms"));
+                w.set_title(&format!("Imperio viewer{disp}{slow} - {fps:.0} fps, rtt {rtt:.1} ms, decode {dec:.1} ms, present {g2g:.1} ms"));
                 tracing::info!(
                     fps = format_args!("{fps:.1}"),
                     rtt_ms = format_args!("{rtt:.1}"),
@@ -409,7 +438,12 @@ impl ApplicationHandler<Net> for App {
                         height,
                         60,
                     ) {
-                        Ok(d) => self.decoder = Some(Box::new(d)),
+                        Ok(d) => {
+                            self.decoder = Some(Box::new(d));
+                            if std::mem::take(&mut self.missed_frames) {
+                                self.send(ControlMessage::RequestKeyframe);
+                            }
+                        }
                         Err(e) => tracing::error!(error = %e, "decoder init failed"),
                     }
                 }
@@ -497,7 +531,7 @@ impl ApplicationHandler<Net> for App {
                     }
                 }
                 if let Some((nx, ny)) = self.normalised_cursor() {
-                    self.send(ControlMessage::Input(InputEvent::MouseMove { nx, ny }));
+                    self.input_event(InputEvent::MouseMove { nx, ny });
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -524,20 +558,20 @@ impl ApplicationHandler<Net> for App {
                             // called off (Esc) rather than dropped wherever
                             // the pointer was left.
                             for down in [true, false] {
-                                self.send(ControlMessage::Input(InputEvent::Key {
+                                self.input_event(InputEvent::Key {
                                     scancode: 0x01,
                                     extended: false,
                                     down,
                                     unicode: None,
-                                }));
+                                });
                             }
                         }
                     }
                 }
-                self.send(ControlMessage::Input(InputEvent::MouseButton {
+                self.input_event(InputEvent::MouseButton {
                     button,
                     down: state == ElementState::Pressed,
-                }));
+                });
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
@@ -547,14 +581,15 @@ impl ApplicationHandler<Net> for App {
                     }
                 };
                 if dx != 0 || dy != 0 {
-                    self.send(ControlMessage::Input(InputEvent::MouseWheel { dx, dy }));
+                    self.input_event(InputEvent::MouseWheel { dx, dy });
                 }
             }
+            WindowEvent::Focused(false) => self.release_held(),
             WindowEvent::ModifiersChanged(m) => {
                 self.ctrl = m.state().control_key();
                 self.shift = m.state().shift_key();
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
                 let down = event.state == ElementState::Pressed;
                 // Local shortcut: F11 toggles full screen (not forwarded).
                 if down && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F11) {
@@ -610,12 +645,18 @@ impl ApplicationHandler<Net> for App {
                     }
                 };
                 let unicode = event.text.as_ref().and_then(|t| t.chars().next());
-                self.send(ControlMessage::Input(InputEvent::Key {
+                // When the window loses the keyboard, the releases it makes
+                // up for the keys that were down arrive after everything has
+                // already been let go over there: nothing left to send.
+                if is_synthetic && !down && !self.input.key_held(scancode, extended) {
+                    return;
+                }
+                self.input_event(InputEvent::Key {
                     scancode,
                     extended,
                     down,
                     unicode,
-                }));
+                });
             }
             _ => {}
         }
@@ -645,6 +686,7 @@ fn spawn_rx(
     link: Arc<SecureLink>,
     proxy: EventLoopProxy<Net>,
     files: imperio_transport::reliable::Reliable,
+    input: Arc<input::InputLine>,
     opts: RxOptions,
 ) {
     let RxOptions { trust_new, expect_id, totp, end_reason } = opts;
@@ -786,6 +828,8 @@ fn spawn_rx(
                                         let _ = proxy.send_event(Net::Bye);
                                         return;
                                     }
+                                    ControlMessage::Features(bits) => input.features(bits),
+                                    ControlMessage::InputAck { seq } => input.confirmed(seq),
                                     _ => {}
                                 },
                                 Some(Incoming::Stream { ack, body }) => files.handle(ack, body),
@@ -828,11 +872,17 @@ fn spawn_rx(
                     last_hello = now;
                 }
                 link.tick(now);
+                input.tick(now);
                 let (frames, need_key) = assembler.poll(now);
                 for f in frames {
                     let _ = proxy.send_event(Net::Frame(f));
                 }
-                if need_key && now.duration_since(last_key_req) > Duration::from_millis(150) {
+                // Ask again only after the answer to the last request has had
+                // time to arrive: on a slow connection a full picture takes a
+                // while, and asking faster only orders more of them.
+                let key_wait = (link.rtt() * 2 + Duration::from_millis(50))
+                    .clamp(Duration::from_millis(150), Duration::from_secs(1));
+                if need_key && now.duration_since(last_key_req) > key_wait {
                     let _ = link.send_control(&ControlMessage::RequestKeyframe);
                     last_key_req = now;
                 }
@@ -1216,7 +1266,8 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
 
     let end_reason: EndReason = Arc::new(Mutex::new(None));
     let event_loop = EventLoop::<Net>::with_user_event().with_any_thread(true).build()?;
-    let files = files::FileBridge::start(link.clone(), req.files_window, args.send_input);
+    let input = input::InputLine::new(link.clone(), args.send_input);
+    let files = files::FileBridge::start(link.clone(), input.clone(), req.files_window, args.send_input);
     files.run_script(std::mem::take(&mut req.file_steps));
     if req.open_files {
         files.open_window();
@@ -1226,6 +1277,7 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
         link.clone(),
         event_loop.create_proxy(),
         files.channel(),
+        input.clone(),
         RxOptions {
             trust_new: args.trust_new,
             expect_id: args.id,
@@ -1267,6 +1319,7 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
 
     let mut app = App {
         link,
+        input,
         send_input: args.send_input,
         totp: args.totp.clone(),
         clipboard,
@@ -1277,6 +1330,7 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
         window: None,
         renderer: None,
         decoder: None,
+        missed_frames: false,
         stream: None,
         monitor: 0,
         monitors: 1,

@@ -90,6 +90,9 @@ struct TxState {
     history: VecDeque<(u32, Bytes)>,
     history_bytes: usize,
     retransmits: u64,
+    /// Media datagrams sent (first transmissions) and their bytes on the wire.
+    media_datagrams: u64,
+    media_bytes: u64,
 }
 
 struct Missing {
@@ -113,6 +116,8 @@ struct RxState {
     owd_min_cur: i64,
     owd_min_prev: i64,
     owd_window_start: Instant,
+    /// Smallest delay above the baseline since the last report.
+    owd_interval_min: i64,
     queue_delay_us: f64,
     last_report: Instant,
 }
@@ -155,6 +160,8 @@ impl SecureLink {
                 history: VecDeque::new(),
                 history_bytes: 0,
                 retransmits: 0,
+                media_datagrams: 0,
+                media_bytes: 0,
             }),
             rx: Mutex::new(RxState {
                 cipher: Cipher::new(&keys.recv),
@@ -170,6 +177,7 @@ impl SecureLink {
                 owd_min_cur: i64::MAX,
                 owd_min_prev: i64::MAX,
                 owd_window_start: now,
+                owd_interval_min: i64::MAX,
                 queue_delay_us: 0.0,
                 last_report: now,
             }),
@@ -199,6 +207,12 @@ impl SecureLink {
         Duration::from_micros(self.rtt_us.load(Ordering::Relaxed))
     }
 
+    /// Media sent so far, for the bitrate controller.
+    pub fn media_sent(&self) -> crate::cc::Sent {
+        let tx = self.tx.lock().unwrap();
+        crate::cc::Sent { datagrams: tx.media_datagrams, bytes: tx.media_bytes }
+    }
+
     fn seal_and_send(&self, tx: &mut TxState, inner: &[u8]) -> io::Result<Bytes> {
         let nonce = tx.nonce;
         tx.nonce += 1;
@@ -219,12 +233,14 @@ impl SecureLink {
         let mut tx = self.tx.lock().unwrap();
         let seq = tx.seq;
         tx.seq = tx.seq.wrapping_add(1);
+        tx.media_datagrams += 1;
         let mut inner = BytesMut::with_capacity(13 + payload.len());
         inner.put_u8(INNER_MEDIA);
         inner.put_u32(seq);
         inner.put_u64(send_ts_us);
         inner.put_slice(payload);
         let wire = self.seal_and_send(&mut tx, &inner)?;
+        tx.media_bytes += wire.len() as u64;
         tx.history_bytes += wire.len();
         tx.history.push_back((seq, wire));
         while tx.history_bytes > HISTORY_BYTES {
@@ -411,15 +427,23 @@ impl SecureLink {
 
     fn track_owd(rx: &mut RxState, send_ts_us: u64, now: Instant) {
         let owd = crate::now_us() as i64 - send_ts_us as i64;
-        if now.duration_since(rx.owd_window_start) > Duration::from_secs(2) {
+        // The shortest delay of the last 10 to 20 seconds is taken as the
+        // empty path. A shorter memory forgets it while a queue stands in
+        // front of the bottleneck: the queue itself becomes the baseline, the
+        // delay reads as zero, and the sender is told all is well.
+        if now.duration_since(rx.owd_window_start) > Duration::from_secs(10) {
             rx.owd_min_prev = rx.owd_min_cur;
             rx.owd_min_cur = i64::MAX;
             rx.owd_window_start = now;
         }
         rx.owd_min_cur = rx.owd_min_cur.min(owd);
         let base = rx.owd_min_cur.min(rx.owd_min_prev);
-        let q = (owd - base).max(0) as f64;
-        rx.queue_delay_us = rx.queue_delay_us * 0.9 + q * 0.1;
+        // The least delayed datagram of each report interval is the one that
+        // found the shortest queue: that is the standing queue. The others
+        // waited behind the rest of their own frame (a large frame takes tens
+        // of milliseconds to cross a slow path) or are retransmissions, and
+        // neither says the path is overloaded.
+        rx.owd_interval_min = rx.owd_interval_min.min((owd - base).max(0));
     }
 
     /// Receiver-side housekeeping: NACK missing datagrams, give up on old
@@ -460,6 +484,10 @@ impl SecureLink {
             }
             if now.duration_since(rx.last_report) >= REPORT_INTERVAL {
                 rx.last_report = now;
+                if rx.owd_interval_min != i64::MAX {
+                    rx.queue_delay_us = rx.queue_delay_us * 0.5 + rx.owd_interval_min as f64 * 0.5;
+                    rx.owd_interval_min = i64::MAX;
+                }
                 report = Some(ReceiverReport {
                     highest_seq: rx.highest.unwrap_or(0),
                     received: rx.received,

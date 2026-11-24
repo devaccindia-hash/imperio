@@ -46,6 +46,10 @@ struct State {
 /// Maps normalised stream coordinates onto the streamed display and injects.
 pub struct Injector {
     state: Mutex<State>,
+    /// `IMPERIO_INPUT_LOG_ONLY` is set: events are written to the log and
+    /// not acted on. For tests of the input path on a computer in use, where
+    /// real key presses would land in whatever window is in front.
+    log_only: bool,
 }
 
 impl Injector {
@@ -57,6 +61,7 @@ impl Injector {
                 keys_down: Vec::new(),
                 buttons_down: Vec::new(),
             }),
+            log_only: std::env::var_os("IMPERIO_INPUT_LOG_ONLY").is_some_and(|v| !v.is_empty()),
         }
     }
 
@@ -105,6 +110,9 @@ impl Injector {
             let mut st = self.state.lock().unwrap();
             (std::mem::take(&mut st.keys_down), std::mem::take(&mut st.buttons_down))
         };
+        if !keys.is_empty() || !buttons.is_empty() {
+            tracing::info!(keys = keys.len(), buttons = buttons.len(), "released what the viewer left held down");
+        }
         for (scancode, extended) in keys {
             self.inject(InputEvent::Key { scancode, extended, down: false, unicode: None });
         }
@@ -133,6 +141,12 @@ impl Injector {
             }
             st.monitor
         };
+        if self.log_only {
+            if !matches!(ev, InputEvent::MouseMove { .. }) {
+                tracing::info!(?ev, "input (log only)");
+            }
+            return;
+        }
         let input = match ev {
             InputEvent::MouseMove { nx, ny } => {
                 let (ml, mt, mw, mh) = monitor;

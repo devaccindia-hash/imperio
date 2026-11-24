@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use imperio_files::ipc::{self, UiCmd, UiEvent, SESSION_XFER_BASE};
 use imperio_files::{clip, Event, Peer, Role};
-use imperio_protocol::{ControlMessage, InputEvent};
+use imperio_protocol::InputEvent;
 use imperio_transport::link::SecureLink;
 use imperio_transport::reliable::{Reliable, Wire};
 
@@ -62,7 +62,8 @@ struct ClipState {
 }
 
 struct Shared {
-    link: Arc<SecureLink>,
+    /// Where the paste that follows an upload is typed.
+    input: Arc<crate::input::InputLine>,
     peer: OnceLock<Peer>,
     window: Mutex<Option<Window>>,
     welcome: Mutex<Option<Welcome>>,
@@ -140,10 +141,19 @@ impl Shared {
             if ok {
                 st.uploaded = seq;
                 drop(st);
-                // The files are on the other clipboard: now the paste itself.
-                for (scancode, down) in [(0x1D, true), (0x2F, true), (0x2F, false), (0x1D, false)] {
-                    let key = InputEvent::Key { scancode, extended: false, down, unicode: None };
-                    let _ = self.link.send_control(&ControlMessage::Input(key));
+                // The files are on the other clipboard: now the paste itself,
+                // Ctrl+V. If the person still holds Ctrl (or holds it again)
+                // only the V is typed: pressing and letting go of Ctrl for
+                // them would leave it up over there while their finger is
+                // still on it, and their next shortcut would type a letter.
+                let ctrl_held = self.input.key_held(0x1D, false) || self.input.key_held(0x1D, true);
+                let keys: &[(u16, bool)] = if ctrl_held {
+                    &[(0x2F, true), (0x2F, false)]
+                } else {
+                    &[(0x1D, true), (0x2F, true), (0x2F, false), (0x1D, false)]
+                };
+                for &(scancode, down) in keys {
+                    self.input.send(InputEvent::Key { scancode, extended: false, down, unicode: None });
                 }
             }
         }
@@ -170,12 +180,17 @@ pub struct FileBridge {
 }
 
 impl FileBridge {
-    pub fn start(link: Arc<SecureLink>, has_window: bool, send_input: bool) -> Arc<Self> {
+    pub fn start(
+        link: Arc<SecureLink>,
+        input: Arc<crate::input::InputLine>,
+        has_window: bool,
+        send_input: bool,
+    ) -> Arc<Self> {
         let wire: Arc<dyn Wire> = link.clone();
         let (chan, inbox) = Reliable::start(wire);
         clip::clean_staging();
         let shared = Arc::new(Shared {
-            link,
+            input,
             peer: OnceLock::new(),
             window: Mutex::new(None),
             welcome: Mutex::new(None),

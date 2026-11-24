@@ -11,6 +11,8 @@
 //! * [`jitter`]: in-order frame assembly with a retransmit deadline and
 //!   keyframe resync.
 //! * [`cc`]: adaptive bitrate from receiver reports.
+//! * [`pacer`]: spreads each frame's datagrams over time.
+//! * [`input`]: numbered, confirmed keyboard and mouse events.
 //! * [`lan`]: frame <-> chunk framing.
 //! * [`reliable`]: an ordered, acknowledged message stream on the same link
 //!   (file transfer), with its own flow and congestion control.
@@ -23,6 +25,7 @@ pub mod cc;
 pub mod clip;
 pub mod crypto;
 pub mod identity;
+pub mod input;
 pub mod jitter;
 pub mod lan;
 pub mod link;

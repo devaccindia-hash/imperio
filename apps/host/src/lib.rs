@@ -31,7 +31,7 @@ use imperio_codec::d3d::{pick_encoder_adapter, Converter, CpuBridge, SharedTextu
 use imperio_codec::mf::MfH264Encoder;
 use imperio_codec::{EncoderConfig, VideoEncoder};
 use imperio_protocol::signal::{Handshake as HandshakeMsg, Kind};
-use imperio_protocol::{ControlMessage, MAX_CLIPBOARD_BYTES, OPEN_CODE, PROTOCOL_VERSION};
+use imperio_protocol::{ControlMessage, FEATURE_INPUT_BATCH, MAX_CLIPBOARD_BYTES, OPEN_CODE, PROTOCOL_VERSION};
 use imperio_transport::cc::BitrateController;
 use imperio_transport::crypto::{random_code, Handshake};
 use imperio_transport::identity::{self, DeviceKey};
@@ -916,7 +916,10 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
     // could type into the consent dialog that is asking about it.
     let authorized = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Event>();
-    let target_kbps = Arc::new(AtomicU32::new(cfg.bitrate_kbps));
+    // Start at half the configured rate and climb from there: the first
+    // seconds must not flood a path nothing is known about yet.
+    let start_kbps = (cfg.bitrate_kbps / 2).max(MIN_KBPS).min(cfg.bitrate_kbps);
+    let target_kbps = Arc::new(AtomicU32::new(start_kbps));
     let last_feedback_us = Arc::new(AtomicU64::new(now_us()));
     // Clipboard sync starts only once the session is authorized (see below).
     let clipboard: Arc<OnceLock<ClipboardSync>> = Arc::new(OnceLock::new());
@@ -934,11 +937,13 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
         let clipboard = clipboard.clone();
         let files = files.clone();
         let totp_secret = ctx.totp_secret.clone();
-        let mut cc = BitrateController::new(cfg.bitrate_kbps, 500, cfg.bitrate_kbps);
+        let mut cc = BitrateController::new(start_kbps, MIN_KBPS.min(cfg.bitrate_kbps), cfg.bitrate_kbps);
         std::thread::Builder::new().name("session-rx".into()).spawn(move || {
             socket.set_read_timeout(Some(Duration::from_millis(50))).ok();
             let mut buf = vec![0u8; 2048];
             let mut clip_in = clip::Reassembler::default();
+            let mut input_in = imperio_transport::input::InputReceiver::default();
+            let mut last_feature_hint = Instant::now();
             let mut last_desktop_check = Instant::now() - Duration::from_secs(1);
             // Attach to the active input desktop up front.
             injector.follow_input_desktop();
@@ -1002,7 +1007,26 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                                     cb.apply_remote(text);
                                 }
                             }
-                            ControlMessage::Input(ev) => injector.inject(ev),
+                            ControlMessage::InputBatch { events } => {
+                                // Numbered events: only the new ones are
+                                // applied, and the viewer is told how far
+                                // this computer has got (see
+                                // `imperio_transport::input`).
+                                let (fresh, seq) = input_in.accept(events);
+                                for ev in fresh {
+                                    injector.inject(ev);
+                                }
+                                let _ = link.send_control(&ControlMessage::InputAck { seq });
+                            }
+                            ControlMessage::Input(ev) => {
+                                injector.inject(ev);
+                                // An unnumbered event from a viewer that could
+                                // number them means it missed the announcement.
+                                if last_feature_hint.elapsed() > Duration::from_secs(1) {
+                                    last_feature_hint = Instant::now();
+                                    let _ = link.send_control(&ControlMessage::Features(FEATURE_INPUT_BATCH));
+                                }
+                            }
                             other => tracing::debug!(?other, "unexpected control message"),
                         }
                     }
@@ -1017,7 +1041,7 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                     }
                     Some(Incoming::Report(r)) => {
                         last_feedback_us.store(now_us(), Ordering::Relaxed);
-                        if let Some(kbps) = cc.on_report(&r, now) {
+                        if let Some(kbps) = cc.on_report(&r, link.media_sent(), now) {
                             target_kbps.store(kbps, Ordering::Relaxed);
                         }
                     }
@@ -1192,6 +1216,67 @@ fn authenticate(
     Ok(())
 }
 
+/// The stream never asks the encoder for less than this.
+const MIN_KBPS: u32 = 300;
+
+/// Slowest pacing of a frame's datagrams, whatever the bitrate target: none.
+/// Pacing follows the target (see `Pacer::set_target`) all the way down, so
+/// that a full picture, a hundred or more datagrams, is never fired into a
+/// slow path faster than the path empties; the tail would be dropped every
+/// time and the picture would never arrive whole. (This was 25 Mbit/s once,
+/// which no weak connection carries.) When the encoder cannot get a busy
+/// screen down to the target, pacing is also what holds the rate: frames
+/// leave more slowly, so fewer are captured.
+const PACE_FLOOR_KBPS: u32 = 0;
+
+/// Full pictures (keyframes) on request, at a rate the path can carry.
+///
+/// A viewer that lost part of a frame asks for a full picture, and keeps
+/// asking until one arrives. A full picture is 20 to 50 times the size of an
+/// ordinary frame; answering every request sends them back to back, which on
+/// a slow path is exactly what keeps the next one from arriving. One is sent
+/// at once; the next waits until the last has had time to cross.
+struct KeyframeGate {
+    wanted: bool,
+    last_sent: Option<Instant>,
+    last_bytes: usize,
+}
+
+impl KeyframeGate {
+    fn new() -> Self {
+        Self { wanted: true, last_sent: None, last_bytes: 0 }
+    }
+
+    fn request(&mut self) {
+        self.wanted = true;
+    }
+
+    /// Time the last full picture needs to cross at the current rate, with
+    /// room for the frames around it.
+    fn spacing(&self, kbps: u32) -> Duration {
+        let crossing = Duration::from_secs_f64(self.last_bytes as f64 * 8.0 / (kbps.max(1) as f64 * 1250.0));
+        (crossing * 2).clamp(Duration::from_millis(300), Duration::from_secs(4))
+    }
+
+    /// Whether the next frame should be a full picture.
+    fn due(&self, kbps: u32) -> bool {
+        self.wanted && self.last_sent.is_none_or(|t| t.elapsed() >= self.spacing(kbps))
+    }
+
+    /// The encoder has been asked for one; it may come out a frame later.
+    fn asked(&mut self) {
+        self.wanted = false;
+        self.last_sent = Some(Instant::now());
+    }
+
+    /// A full picture went out (asked for or the encoder's own).
+    fn sent(&mut self, bytes: usize) {
+        self.wanted = false;
+        self.last_sent = Some(Instant::now());
+        self.last_bytes = bytes;
+    }
+}
+
 /// How long a session waits for the screen to become capturable again (an
 /// elevation prompt or lock screen that this process may not capture, a
 /// display being reconfigured) before giving up.
@@ -1209,7 +1294,8 @@ fn stream_loop(
     end_session: &AtomicBool,
 ) -> anyhow::Result<SessionEnd> {
     tracing::info!("viewer authenticated; streaming");
-    link.send_control(&first.stream_info())?;
+    announce(link, &first)?;
+    let announced = Instant::now();
 
     // `None` while the pipeline is being rebuilt (display switch, or the
     // desktop duplication was lost). The old one is dropped *before* a new
@@ -1218,11 +1304,11 @@ fn stream_loop(
     let mut slot = Some(first);
     let mut lost_since: Option<Instant> = None;
 
-    let mut force_key = true;
+    let mut keys = KeyframeGate::new();
     let mut frame_id = 0u32;
     let mut stats = Stats::default();
     let mut current_kbps = cfg.bitrate_kbps;
-    let mut pacer = Pacer::new(current_kbps, 25_000);
+    let mut pacer = Pacer::new(current_kbps, PACE_FLOOR_KBPS);
     let frame_timeout = Duration::from_millis(1000 / cfg.fps.max(1) as u64 + 1);
 
     loop {
@@ -1233,13 +1319,18 @@ fn stream_loop(
         }
         while let Ok(ev) = rx.try_recv() {
             match ev {
-                Event::KeyframeRequest => force_key = true,
+                Event::KeyframeRequest => keys.request(),
                 Event::Bye => return Ok(SessionEnd::Bye),
                 Event::Totp(_) | Event::Incompatible(_) => {}
                 Event::Hello => {
-                    force_key = true;
+                    // The viewer repeats Hello until the stream description
+                    // reaches it. One that was already on its way when the
+                    // description left needs no second full picture.
+                    if announced.elapsed() > Duration::from_millis(250) {
+                        keys.request();
+                    }
                     if let Some(p) = &slot {
-                        link.send_control(&p.stream_info())?;
+                        announce(link, p)?;
                     }
                 }
                 Event::SelectMonitor(n) => {
@@ -1264,13 +1355,14 @@ fn stream_loop(
                         p.rect.right - p.rect.left,
                         p.rect.bottom - p.rect.top,
                     );
-                    link.send_control(&p.stream_info())?;
+                    announce(link, &p)?;
                     tracing::info!(monitor, "capture pipeline (re)built");
                     // A fresh encoder starts at the configured bitrate; the
                     // adaptive target is re-applied on the next pass.
                     current_kbps = cfg.bitrate_kbps;
-                    pacer.set_target(current_kbps, 25_000);
-                    force_key = true;
+                    pacer.set_target(current_kbps, PACE_FLOOR_KBPS);
+                    // A new encoder starts with a full picture by itself.
+                    keys = KeyframeGate::new();
                     slot = Some(p);
                 }
                 Err(e) => {
@@ -1288,9 +1380,10 @@ fn stream_loop(
         let want = target_kbps.load(Ordering::Relaxed);
         if want != current_kbps && p_set_bitrate(pipeline, want) {
             current_kbps = want;
-            pacer.set_target(want, 25_000);
+            pacer.set_target(want, PACE_FLOOR_KBPS);
         }
 
+        let force_key = keys.due(current_kbps);
         let step = match pipeline.capture_encode(frame_timeout, force_key) {
             Ok(step) => step,
             Err(e) => {
@@ -1305,22 +1398,34 @@ fn stream_loop(
         let Some((outputs, coalesced, cap_wait, stages)) = step else {
             continue;
         };
-        force_key = false;
+        if force_key {
+            keys.asked();
+        }
         stats.coalesced += coalesced as u64;
         for (out, captured_us) in outputs {
             frame_id = frame_id.wrapping_add(1);
             let t_send = Instant::now();
+            pacer.begin_frame(out.data.len());
             for c in lan::split(frame_id, out.keyframe, captured_us, &out.data) {
                 pacer.wait_for(c.len() + 40);
                 link.send_media(&c, now_us())?;
             }
             link.send_media(&[], now_us())?;
             link.send_media(&[], now_us())?;
+            if out.keyframe {
+                keys.sent(out.data.len());
+            }
             stats.record(cap_wait, out.encode_time, out.data.len(), out.keyframe);
             stats.stage(stages, t_send.elapsed());
         }
         stats.maybe_report(link, current_kbps);
     }
+}
+
+/// Tell the viewer what is being streamed and what this version understands.
+fn announce(link: &SecureLink, p: &Pipeline) -> std::io::Result<()> {
+    link.send_control(&p.stream_info())?;
+    link.send_control(&ControlMessage::Features(FEATURE_INPUT_BATCH))
 }
 
 fn p_set_bitrate(p: &mut Pipeline, kbps: u32) -> bool {
@@ -1341,6 +1446,8 @@ struct Stats {
     frames: u64,
     bytes: u64,
     keyframes: u64,
+    /// Largest full picture sent, in bytes.
+    key_bytes_max: usize,
     coalesced: u64,
     cap_total: Duration,
     enc_total: Duration,
@@ -1361,6 +1468,9 @@ impl Stats {
         self.frames += 1;
         self.bytes += bytes as u64;
         self.keyframes += key as u64;
+        if key {
+            self.key_bytes_max = self.key_bytes_max.max(bytes);
+        }
         self.cap_total += cap;
         self.enc_total += enc;
         self.enc_max = self.enc_max.max(enc);
@@ -1393,6 +1503,7 @@ impl Stats {
                 video_mbps = format_args!("{:.2}", self.bytes as f64 * 8.0 / 1e6 / secs),
                 target_kbps = kbps,
                 keyframes = self.keyframes,
+                keyframe_kb = self.key_bytes_max / 1000,
                 enc_ms = format_args!("{:.2}", self.enc_total.as_secs_f64() * 1e3 / self.frames as f64),
                 enc_max_ms = format_args!("{:.1}", self.enc_max.as_secs_f64() * 1e3),
                 cursor_ms = format_args!("{:.2}", self.cursor_total.as_secs_f64() * 1e3 / self.frames as f64),
