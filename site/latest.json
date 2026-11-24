@@ -1,7 +1,7 @@
 {
-  "version": "0.3.17",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.17/Imperio.exe",
-  "sha256": "f63c98f313363a3e57e32721179b857427acb26d4889c6d716d1e7b8aa514a24",
-  "notes": "Drag a file out of the remote screen onto your own Desktop or a folder, and a View menu with zoom.",
-  "sig": "4LHaXIiaZElbPsrsrz7uMzhSlWH1nweTfO6JgMu1LCJ-3B-07BnCd2XBBpNa8LPHXh91kdc1MWgi8vFTRdq-Cg"
+  "version": "0.3.18",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.18/Imperio.exe",
+  "sha256": "fbbad62441183f4313bf8c170b06e46bc990ea21076fc3faccafdb54b44ab009",
+  "notes": "Weak connections no longer freeze the picture or make the ping climb, and key presses always arrive, so keys no longer get stuck.",
+  "sig": "64pIR2tqYe0pAUD8TdyU9MjuIYxRArdAWtVw8B93yjQ9JjDOHKVOSlupGv2GXnvJonhYqxYDi6LdXIro6O6CAQ"
 }
