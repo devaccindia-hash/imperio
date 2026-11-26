@@ -10,17 +10,18 @@
 //! Two combinations cannot be taken by any program and stay with this
 //! computer: Ctrl+Alt+Del and Windows+L.
 //!
-//! The hook is installed only while the session window has the keyboard, and
-//! it is called on the window's own thread (the one that installed it).
+//! The hook is installed only while the session window has the keyboard, on a
+//! thread of its own (see [`KeyGrab`]).
 
 use std::sync::{Arc, Mutex};
 
 use imperio_protocol::InputEvent;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_RWIN, VK_TAB};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, LLKHF_EXTENDED,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_ALTDOWN, LLKHF_EXTENDED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
 };
 
 use crate::input::InputLine;
@@ -61,6 +62,7 @@ unsafe extern "system" fn hook_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT 
         if let Ok(mut state) = STATE.lock() {
             if let Some(st) = state.as_mut() {
                 if wanted(k.vkCode, down, alt, ctrl, &st.taken) {
+                    tracing::debug!(vk = k.vkCode, scan = k.scanCode, down, "key taken for the other computer");
                     st.taken.retain(|v| *v != k.vkCode);
                     if down {
                         st.taken.push(k.vkCode);
@@ -82,19 +84,25 @@ unsafe extern "system" fn hook_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT 
     CallNextHookEx(None, code, w, l)
 }
 
-/// The hook, while it is installed. Create and drop it on the window's thread.
+/// The hook, while it is installed.
+///
+/// It lives on a thread of its own that does nothing but wait for Windows
+/// to call it. Installed on the session window's thread it was never called
+/// at all (seen on Windows 11 with a window that also receives raw input, as
+/// this one does), and a hook that answers late is dropped by Windows
+/// without a word, so it must not share a thread with decoding and drawing.
 pub struct KeyGrab {
-    hook: Option<HHOOK>,
+    thread: Option<(u32, std::thread::JoinHandle<()>)>,
     input: Arc<InputLine>,
 }
 
 impl KeyGrab {
     pub fn new(input: Arc<InputLine>) -> Self {
-        Self { hook: None, input }
+        Self { thread: None, input }
     }
 
     pub fn active(&self) -> bool {
-        self.hook.is_some()
+        self.thread.is_some()
     }
 
     /// Take the keys (the session window got the keyboard) or give them back
@@ -105,17 +113,47 @@ impl KeyGrab {
         }
         if on {
             *STATE.lock().unwrap() = Some(State { input: self.input.clone(), taken: Vec::new() });
-            // SAFETY: the procedure is a plain function that outlives the hook.
-            match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) } {
-                Ok(h) => self.hook = Some(h),
-                Err(e) => {
-                    tracing::warn!(error = %e, "the Windows key and Alt+Tab stay with this computer (keyboard hook unavailable)");
+            let (ready, started) = std::sync::mpsc::channel::<Result<u32, String>>();
+            let spawned = std::thread::Builder::new().name("key-hook".into()).spawn(move || {
+                // SAFETY: the procedure is a plain function; the hook is
+                // removed below, on the thread that installed it.
+                let hook: HHOOK = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), Some(imperio_ui::hinstance()), 0) } {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = ready.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+                // SAFETY: plain call.
+                let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
+                let mut msg = MSG::default();
+                // Windows calls the hook from inside GetMessageW; the loop
+                // ends on the WM_QUIT posted by `set_active(false)`.
+                // SAFETY: standard message loop on this thread.
+                unsafe {
+                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+                    let _ = UnhookWindowsHookEx(hook);
+                }
+            });
+            match spawned.ok().zip(started.recv().ok()) {
+                Some((handle, Ok(id))) => {
+                    tracing::info!("keys: the Windows key and Alt+Tab now go to the other computer");
+                    self.thread = Some((id, handle));
+                }
+                other => {
+                    let why = match other {
+                        Some((_, Err(e))) => e,
+                        _ => "the hook thread did not start".to_string(),
+                    };
+                    tracing::warn!(error = %why, "the Windows key and Alt+Tab stay with this computer (keyboard hook unavailable)");
                     *STATE.lock().unwrap() = None;
                 }
             }
-        } else if let Some(h) = self.hook.take() {
-            // SAFETY: a hook this thread installed.
-            let _ = unsafe { UnhookWindowsHookEx(h) };
+        } else if let Some((id, handle)) = self.thread.take() {
+            // SAFETY: plain call; a thread that has gone just makes it fail.
+            let _ = unsafe { PostThreadMessageW(id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+            let _ = handle.join();
+            tracing::info!("keys: the Windows key and Alt+Tab are back with this computer");
             // Whatever was held is let go by the caller (`release_held`).
             *STATE.lock().unwrap() = None;
         }

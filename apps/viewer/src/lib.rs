@@ -1338,6 +1338,12 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
 
     let end_reason: EndReason = Arc::new(Mutex::new(None));
     let event_loop = EventLoop::<Net>::with_user_event().with_any_thread(true).build()?;
+    // The window's own key and mouse events are all this program uses. Raw
+    // device events must stay off: while a program is registered for raw
+    // keyboard input, Windows does not call a low-level keyboard hook of
+    // that same program, and the Windows key and Alt+Tab could not be taken
+    // for the other computer (see `keyhook`).
+    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
     let input = input::InputLine::new(link.clone(), args.send_input);
     let files = files::FileBridge::start(link.clone(), input.clone(), req.files_window, args.send_input);
     files.run_script(std::mem::take(&mut req.file_steps));
