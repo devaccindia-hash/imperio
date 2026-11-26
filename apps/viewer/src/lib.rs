@@ -14,6 +14,7 @@
 
 pub mod files;
 mod input;
+mod keyhook;
 mod known_hosts;
 mod render;
 mod ui;
@@ -59,6 +60,11 @@ enum Net {
         codec: VideoCodec,
         monitor: u8,
         monitors: u8,
+    },
+    /// The other screen's own size (the picture may arrive smaller).
+    NativeSize {
+        width: u32,
+        height: u32,
     },
     Clipboard(String),
     Frame(CompleteFrame),
@@ -128,6 +134,12 @@ struct App {
     /// Where keyboard and mouse events go out (see `input`).
     input: Arc<input::InputLine>,
     send_input: bool,
+    /// Takes the Windows key and Alt+Tab for the other computer while this
+    /// window is in front (see `keyhook`).
+    key_grab: keyhook::KeyGrab,
+    /// The user's choice in the Session menu; on unless switched off.
+    system_keys: bool,
+    focused: bool,
     totp: Option<String>,
     clipboard: Option<Arc<ClipboardSync>>,
     files: Arc<files::FileBridge>,
@@ -274,6 +286,12 @@ impl App {
         self.swallow_v = false;
     }
 
+    /// Take or give back the Windows key and Alt+Tab, to match whether this
+    /// window is in front and what the Session menu says.
+    fn apply_system_keys(&mut self) {
+        self.key_grab.set_active(self.send_input && self.system_keys && self.focused);
+    }
+
     fn update_title(&self) {
         if let Some(w) = &self.window {
             let hint = if self.monitors > 1 {
@@ -349,7 +367,15 @@ impl App {
                 let rtt = self.link.rtt().as_secs_f64() * 1e3;
                 // Said in words too: a slow picture with a long round trip
                 // is the connection, not either computer.
-                let slow = if rtt > 150.0 { " - slow connection" } else { "" };
+                // A smaller picture is the other computer's answer to a
+                // connection that carries little: say that too, or the
+                // softer picture looks like a fault.
+                let reduced = self.renderer.as_ref().is_some_and(|r| r.reduced());
+                let slow = match (rtt > 150.0, reduced) {
+                    (_, true) => " - slow connection, picture simplified",
+                    (true, false) => " - slow connection",
+                    (false, false) => "",
+                };
                 let disp = if self.monitors > 1 { format!(" [display {}/{}]", self.monitor + 1, self.monitors) } else { String::new() };
                 w.set_title(&format!("Imperio viewer{disp}{slow} - {fps:.0} fps, rtt {rtt:.1} ms, decode {dec:.1} ms, present {g2g:.1} ms"));
                 tracing::info!(
@@ -381,7 +407,11 @@ impl ApplicationHandler<Net> for App {
         // `ui::SessionMenu`), which does not depend on how COM was set up on
         // this thread; winit's OLE drop target would take them first.
         use winit::platform::windows::WindowAttributesExtWindows;
+        // The logo in the title bar and on the taskbar.
+        let icon = |size: u32| winit::window::Icon::from_rgba(imperio_ui::logo::rgba(size, imperio_ui::logo::RED), size, size).ok();
         let attrs = Window::default_attributes()
+            .with_window_icon(icon(32))
+            .with_taskbar_icon(icon(64))
             .with_drag_and_drop(false)
             .with_title("imperio viewer - connecting...")
             .with_inner_size(PhysicalSize::new(1280u32, 720u32));
@@ -399,6 +429,9 @@ impl ApplicationHandler<Net> for App {
             if let RawWindowHandle::Win32(w32) = h.as_raw() {
                 let hwnd = windows::Win32::Foundation::HWND(w32.hwnd.get() as *mut _);
                 self.menu = ui::SessionMenu::attach(hwnd);
+                if let (Some(m), false) = (&self.menu, self.send_input) {
+                    m.disable_system_keys();
+                }
             }
         }
         self.window = Some(window);
@@ -420,17 +453,29 @@ impl ApplicationHandler<Net> for App {
                 monitor,
                 monitors,
             } => {
-                self.monitor = monitor;
-                self.monitors = monitors;
-                self.update_title();
-                if let Some(m) = &self.menu {
-                    m.set_displays(monitors, monitor);
+                // The description is repeated by the other computer; only a
+                // change is acted on.
+                if (self.monitor, self.monitors) != (monitor, monitors) || self.stream.is_none() {
+                    self.monitor = monitor;
+                    self.monitors = monitors;
+                    self.update_title();
+                    if let Some(m) = &self.menu {
+                        m.set_displays(monitors, monitor);
+                    }
                 }
                 if self.stream != Some((width, height)) {
                     tracing::info!(width, height, ?codec, monitor, monitors, "stream info");
-                    self.stream = Some((width, height));
+                    let first = self.stream.replace((width, height)).is_none();
                     if let Some(r) = self.renderer.as_mut() {
                         r.set_source_size(width, height);
+                    }
+                    // A recording holds one picture size: one that is under
+                    // way is closed, and the next frame starts a new file.
+                    if let Some(rec) = self.recorder.take() {
+                        match rec.finish() {
+                            Ok((path, frames)) => tracing::info!(path = %path.display(), frames, "recording saved (the picture changed size; continuing in a new file)"),
+                            Err(e) => tracing::warn!(error = %e, "recording finalize failed"),
+                        }
                     }
                     match MfH264Decoder::new(
                         self.renderer.as_ref().unwrap().device(),
@@ -440,12 +485,20 @@ impl ApplicationHandler<Net> for App {
                     ) {
                         Ok(d) => {
                             self.decoder = Some(Box::new(d));
-                            if std::mem::take(&mut self.missed_frames) {
+                            // Frames that went to no decoder, or to the one
+                            // for the old size, are gone: start from a full
+                            // picture.
+                            if std::mem::take(&mut self.missed_frames) || !first {
                                 self.send(ControlMessage::RequestKeyframe);
                             }
                         }
                         Err(e) => tracing::error!(error = %e, "decoder init failed"),
                     }
+                }
+            }
+            Net::NativeSize { width, height } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_native_size(width, height);
                 }
             }
             Net::Clipboard(text) => {
@@ -471,6 +524,16 @@ impl ApplicationHandler<Net> for App {
                     }
                 }
                 ui::UiCmd::ToggleRecording => self.toggle_recording(),
+                ui::UiCmd::ToggleSystemKeys => {
+                    self.system_keys = !self.system_keys;
+                    self.apply_system_keys();
+                    if !self.system_keys {
+                        self.release_held();
+                    }
+                    if let Some(m) = &self.menu {
+                        m.set_system_keys(self.system_keys);
+                    }
+                }
                 ui::UiCmd::Files => self.files.open_window(),
                 ui::UiCmd::Zoom(z) => self.zoom(z),
                 ui::UiCmd::Dropped(paths) => self.files.send_dropped(paths),
@@ -584,7 +647,13 @@ impl ApplicationHandler<Net> for App {
                     self.input_event(InputEvent::MouseWheel { dx, dy });
                 }
             }
-            WindowEvent::Focused(false) => self.release_held(),
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                self.apply_system_keys();
+                if !focused {
+                    self.release_held();
+                }
+            }
             WindowEvent::ModifiersChanged(m) => {
                 self.ctrl = m.state().control_key();
                 self.shift = m.state().shift_key();
@@ -827,6 +896,9 @@ fn spawn_rx(
                                     ControlMessage::Bye => {
                                         let _ = proxy.send_event(Net::Bye);
                                         return;
+                                    }
+                                    ControlMessage::NativeSize { width, height } => {
+                                        let _ = proxy.send_event(Net::NativeSize { width, height });
                                     }
                                     ControlMessage::Features(bits) => input.features(bits),
                                     ControlMessage::InputAck { seq } => input.confirmed(seq),
@@ -1319,6 +1391,9 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
 
     let mut app = App {
         link,
+        key_grab: keyhook::KeyGrab::new(input.clone()),
+        system_keys: true,
+        focused: false,
         input,
         send_input: args.send_input,
         totp: args.totp.clone(),
@@ -1348,6 +1423,7 @@ pub fn run_session(mut req: SessionRequest) -> anyhow::Result<()> {
         recorder: None,
     };
     event_loop.run_app(&mut app)?;
+    app.key_grab.set_active(false);
     files.shutdown();
     app.stop_recording(false);
     // Ended by the network side (refused, identity problem, link lost)?

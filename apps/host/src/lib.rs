@@ -160,8 +160,15 @@ struct StageTimes {
 /// or the desktop duplication is lost (secure desktop, resolution change).
 struct Pipeline {
     cap: Capturer,
+    /// The device the picture is converted and encoded on.
+    dev: VideoDevice,
+    /// Size of the picture as sent.
     width: u32,
     height: u32,
+    /// Size of the screen itself (see [`SIZE_STEPS`]).
+    native: (u32, u32),
+    /// Index into [`SIZE_STEPS`] of the size being sent.
+    size_step: usize,
     rect: RECT,
     monitor_index: u8,
     monitor_count: u8,
@@ -178,12 +185,157 @@ struct Pipeline {
     in_encoder: std::collections::VecDeque<(i64, u64)>,
 }
 
+/// The picture is sent at the screen's own size, or at three quarters or half
+/// of it each way when the connection carries too little for that. A full HD
+/// screen at 1 Mbit/s cannot be encoded small enough at full size: every
+/// frame is large, so few get through and the picture moves in jerks. A
+/// smaller picture is softer but moves.
+const SIZE_STEPS: [f64; 3] = [1.0, 0.75, 0.5];
+
+/// A size needs about this many kbit/s per million pixels sent to look
+/// reasonable and keep moving (full HD at full size: about 1.9 Mbit/s).
+const KBPS_PER_MEGAPIXEL: f64 = 900.0;
+
+/// The size sent at step `step` for a screen of `native` pixels (even numbers,
+/// as the encoder requires).
+fn stepped_size(native: (u32, u32), step: usize) -> (u32, u32) {
+    let f = SIZE_STEPS[step.min(SIZE_STEPS.len() - 1)];
+    let side = |v: u32| (((v as f64 * f).round() as u32) & !1).max(2);
+    (side(native.0), side(native.1))
+}
+
+/// Chooses the size step from the bitrate the connection is carrying.
+///
+/// Changing size restarts the encoder and sends a full picture, so it must
+/// not happen on a passing dip: the size goes down only when the target has
+/// stayed too low for a couple of seconds, and comes back up only when it has
+/// been comfortably high for longer, and not soon after the last change.
+///
+/// A high target is not proof that the path carries a larger picture: a
+/// small picture of a quiet screen uses a fraction of its target, and the
+/// target drifts up unchallenged. Going up is therefore a trial. One that
+/// fails (the size has to come down again shortly after) goes back to the
+/// size before it and doubles the wait before that larger size is tried
+/// again, so a path that is simply slow is tried less and less often
+/// instead of every few seconds.
+/// A change of picture size decided by [`SizeChooser`].
+struct SizeChange {
+    step: usize,
+    /// The bitrate target to continue from, when the one in force says
+    /// little about the new size: a larger picture starts at what it needs
+    /// and no more (the target reached with the smaller one was never put
+    /// to the test), and after a failed trial the smaller picture gets back
+    /// what it had, not what the target collapsed to.
+    target_kbps: Option<u32>,
+}
+
+struct SizeChooser {
+    step: usize,
+    low_since: Option<Instant>,
+    high_since: Option<Instant>,
+    changed: Instant,
+    /// When the size last went up, until that has proved to hold.
+    went_up: Option<Instant>,
+    /// How long after a change the size may go up to each step.
+    up_wait: [Duration; SIZE_STEPS.len()],
+    /// `IMPERIO_FIXED_SIZE` is set: always the screen's own size (for
+    /// comparing with and without).
+    fixed: bool,
+}
+
+impl SizeChooser {
+    const DOWN_AFTER: Duration = Duration::from_secs(2);
+    const UP_AFTER: Duration = Duration::from_secs(6);
+    const SETTLE: Duration = Duration::from_secs(10);
+    /// A larger size that lasted this long was the right call.
+    const PROVEN: Duration = Duration::from_secs(45);
+    /// Longest wait between trials of a larger size.
+    const LONGEST_WAIT: Duration = Duration::from_secs(300);
+    /// The target must exceed what the larger size needs by this much.
+    const UP_MARGIN: f64 = 1.3;
+
+    fn new(now: Instant) -> Self {
+        Self {
+            step: 0,
+            low_since: None,
+            high_since: None,
+            changed: now,
+            went_up: None,
+            up_wait: [Self::SETTLE; SIZE_STEPS.len()],
+            fixed: std::env::var_os("IMPERIO_FIXED_SIZE").is_some_and(|v| !v.is_empty()),
+        }
+    }
+
+    /// kbit/s that sending `native` at `step` needs.
+    fn needs(native: (u32, u32), step: usize) -> f64 {
+        let (w, h) = stepped_size(native, step);
+        w as f64 * h as f64 / 1e6 * KBPS_PER_MEGAPIXEL
+    }
+
+    /// What a size is started at: a little more than it needs.
+    fn starting_kbps(native: (u32, u32), step: usize) -> f64 {
+        Self::needs(native, step) * 1.1
+    }
+
+    /// Feed the current target; returns the change to make, if any.
+    fn update(&mut self, target_kbps: u32, native: (u32, u32), now: Instant) -> Option<SizeChange> {
+        if self.fixed {
+            return None;
+        }
+        let kbps = target_kbps as f64;
+        let too_low = self.step + 1 < SIZE_STEPS.len() && kbps < Self::needs(native, self.step);
+        let roomy = self.step > 0 && kbps > Self::needs(native, self.step - 1) * Self::UP_MARGIN;
+        self.low_since = if too_low { self.low_since.or(Some(now)) } else { None };
+        self.high_since = if roomy { self.high_since.or(Some(now)) } else { None };
+        let held = |since: Option<Instant>, long: Duration| since.is_some_and(|t| now.duration_since(t) >= long);
+        if held(self.went_up, Self::PROVEN) {
+            self.went_up = None;
+            self.up_wait[self.step] = Self::SETTLE;
+        }
+        let mut restart = None;
+        // A size on trial is given up quickly: every moment it stays, the
+        // picture stutters.
+        let down_after = if self.went_up.is_some() { Duration::from_millis(700) } else { Self::DOWN_AFTER };
+        let next = if held(self.low_since, down_after) {
+            let mut step = self.step + 1;
+            if self.went_up.take().is_some() {
+                // The trial of this size failed: back to the one before it.
+                // (The target has collapsed with it and says little.)
+                self.up_wait[self.step] = (self.up_wait[self.step] * 2).min(Self::LONGEST_WAIT);
+                restart = Some(kbps.max(Self::starting_kbps(native, step)));
+            } else {
+                // Straight to a size this target is enough for, not one
+                // step (and one full picture) at a time.
+                while step + 1 < SIZE_STEPS.len() && kbps < Self::needs(native, step) {
+                    step += 1;
+                }
+            }
+            step
+        } else if held(self.high_since, Self::UP_AFTER) && now.duration_since(self.changed) >= self.up_wait[self.step - 1] {
+            self.went_up = Some(now);
+            restart = Some(kbps.min(Self::starting_kbps(native, self.step - 1)));
+            self.step - 1
+        } else {
+            return None;
+        };
+        self.step = next;
+        self.low_since = None;
+        self.high_since = None;
+        self.changed = now;
+        Some(SizeChange { step: next, target_kbps: restart.map(|k| k as u32) })
+    }
+}
+
 impl Pipeline {
-    fn for_monitor(cfg: &Config, index: u8) -> anyhow::Result<Self> {
+    /// `size_step` and `kbps` are where the session stands: a pipeline
+    /// rebuilt in the middle of one (display switch, lock screen) carries on
+    /// at the size and rate the connection was carrying.
+    fn for_monitor(cfg: &Config, index: u8, size_step: usize, kbps: u32) -> anyhow::Result<Self> {
         let monitor_count = Capturer::monitors().len().max(1) as u8;
         let (cap, actual) = Capturer::at_index(index as usize)?;
         let monitor_index = actual as u8;
-        let (width, height) = (cap.width() & !1, cap.height() & !1);
+        let native = (cap.width() & !1, cap.height() & !1);
+        let (width, height) = stepped_size(native, size_step);
         let m = cap.monitor();
         let rect = monitor_rect(m);
         // Choose where to encode. Same-adapter (shared texture) when the
@@ -198,13 +350,7 @@ impl Pipeline {
         let ring = (0..4)
             .map(|_| dev.create_texture(width, height, NV12))
             .collect::<Result<Vec<_>, _>>()?;
-        let ecfg = EncoderConfig {
-            width,
-            height,
-            fps: cfg.fps,
-            bitrate_kbps: cfg.bitrate_kbps,
-            ..Default::default()
-        };
+        let ecfg = EncoderConfig { width, height, fps: cfg.fps, bitrate_kbps: kbps, ..Default::default() };
         let encoder = MfH264Encoder::new(&dev, ecfg)?;
         let cursor = if cfg.show_cursor {
             match cursor::CursorPainter::new(cap.device(), cap.width(), cap.height()) {
@@ -220,8 +366,11 @@ impl Pipeline {
         tracing::info!(encoder = encoder.name(), transfer = %transfer_path, width, height, monitor = monitor_index, of = monitor_count, "pipeline ready");
         Ok(Self {
             cap,
+            dev,
             width,
             height,
+            native,
+            size_step,
             rect,
             monitor_index,
             monitor_count,
@@ -235,6 +384,30 @@ impl Pipeline {
             cursor,
             start: Instant::now(),
         })
+    }
+
+    /// Send the same screen at another size: a new converter and encoder on
+    /// the device already in use. The capture itself is left alone, so the
+    /// change costs one full picture and no pause. On failure nothing has
+    /// changed.
+    fn resize(&mut self, cfg: &Config, size_step: usize, kbps: u32) -> anyhow::Result<()> {
+        let (width, height) = stepped_size(self.native, size_step);
+        let converter = Converter::new(&self.dev, self.cap.width(), self.cap.height(), width, height, true)?;
+        let ring = (0..4)
+            .map(|_| self.dev.create_texture(width, height, NV12))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ecfg = EncoderConfig { width, height, fps: cfg.fps, bitrate_kbps: kbps, ..Default::default() };
+        let encoder = MfH264Encoder::new(&self.dev, ecfg)?;
+        self.converter = converter;
+        self.ring = ring;
+        self.ring_i = 0;
+        self.last_slot = None;
+        self.in_encoder.clear();
+        self.encoder = encoder;
+        self.width = width;
+        self.height = height;
+        self.size_step = size_step;
+        Ok(())
     }
 
     fn stream_info(&self) -> ControlMessage {
@@ -920,6 +1093,9 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
     // seconds must not flood a path nothing is known about yet.
     let start_kbps = (cfg.bitrate_kbps / 2).max(MIN_KBPS).min(cfg.bitrate_kbps);
     let target_kbps = Arc::new(AtomicU32::new(start_kbps));
+    // Set by the stream loop when the picture changes size: the target the
+    // bitrate control (which lives on the receive thread) continues from.
+    let target_reset = Arc::new(AtomicU32::new(0));
     let last_feedback_us = Arc::new(AtomicU64::new(now_us()));
     // Clipboard sync starts only once the session is authorized (see below).
     let clipboard: Arc<OnceLock<ClipboardSync>> = Arc::new(OnceLock::new());
@@ -933,6 +1109,7 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
         let authorized = authorized.clone();
         let injector = injector.clone();
         let target_kbps = target_kbps.clone();
+        let target_reset = target_reset.clone();
         let last_feedback_us = last_feedback_us.clone();
         let clipboard = clipboard.clone();
         let files = files.clone();
@@ -944,6 +1121,8 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
             let mut clip_in = clip::Reassembler::default();
             let mut input_in = imperio_transport::input::InputReceiver::default();
             let mut last_feature_hint = Instant::now();
+            let mut shares = SendRates::default();
+            let mut last_share_log = Instant::now();
             let mut last_desktop_check = Instant::now() - Duration::from_secs(1);
             // Attach to the active input desktop up front.
             injector.follow_input_desktop();
@@ -1041,8 +1220,34 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                     }
                     Some(Incoming::Report(r)) => {
                         last_feedback_us.store(now_us(), Ordering::Relaxed);
-                        if let Some(kbps) = cc.on_report(&r, link.media_sent(), now) {
+                        // The picture and a file copy travel the same path.
+                        // The bitrate control is told what the copy sends,
+                        // and the copy is held to the part of the target the
+                        // picture is not using (see `file_ceiling`).
+                        let reset = target_reset.swap(0, Ordering::Relaxed);
+                        if reset != 0 {
+                            cc.set_target(reset, now);
+                        }
+                        let media = link.media_sent();
+                        let chan = files.get();
+                        let (video_kbps, file_kbps) = shares.rates(now, media.bytes, chan.map_or(0, |f| f.sent_bytes()));
+                        cc.set_other_load(file_kbps);
+                        if let Some(kbps) = cc.on_report(&r, media, now) {
                             target_kbps.store(kbps, Ordering::Relaxed);
+                        }
+                        if let Some(f) = chan {
+                            let ceiling = file_ceiling(cc.target_kbps(), cc.limited(), video_kbps);
+                            f.set_rate_limit(ceiling);
+                            if f.busy() && last_share_log.elapsed() > Duration::from_secs(2) {
+                                last_share_log = now;
+                                tracing::info!(
+                                    files_kbps = file_kbps as u32,
+                                    picture_kbps = video_kbps as u32,
+                                    file_ceiling_kbps = ceiling,
+                                    target_kbps = cc.target_kbps(),
+                                    "sharing the connection between the picture and a file copy"
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -1093,7 +1298,7 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
         }
 
         // Build the capture + encode pipeline now that the peer is trusted.
-        let pipeline = Pipeline::for_monitor(cfg, cfg.monitor)?;
+        let pipeline = Pipeline::for_monitor(cfg, cfg.monitor, 0, start_kbps)?;
         injector.set_monitor(
             pipeline.rect.left,
             pipeline.rect.top,
@@ -1135,7 +1340,7 @@ fn run_session(ctx: SessionCtx, link: Arc<SecureLink>, socket: &Arc<UdpSocket>) 
                 })
                 .ok();
         }
-        stream_loop(cfg, pipeline, &injector, &link, &rx, &target_kbps, &last_feedback_us, &ctx.end_session)
+        stream_loop(cfg, pipeline, &injector, &link, &rx, &target_kbps, &target_reset, &last_feedback_us, &ctx.end_session)
     })();
 
     authorized.store(false, Ordering::Release);
@@ -1219,6 +1424,51 @@ fn authenticate(
 /// The stream never asks the encoder for less than this.
 const MIN_KBPS: u32 = 300;
 
+/// How fast the picture and the file stream have been leaving, measured over
+/// about half a second from the running totals of bytes sent.
+#[derive(Default)]
+struct SendRates {
+    /// (when, picture bytes, file bytes), oldest first.
+    samples: std::collections::VecDeque<(Instant, u64, u64)>,
+}
+
+impl SendRates {
+    const WINDOW: Duration = Duration::from_millis(500);
+
+    /// Add the totals as they stand; returns (picture, files) in kbit/s.
+    fn rates(&mut self, now: Instant, picture_bytes: u64, file_bytes: u64) -> (f64, f64) {
+        self.samples.push_back((now, picture_bytes, file_bytes));
+        while self.samples.len() > 2 && now.duration_since(self.samples[1].0) >= Self::WINDOW {
+            self.samples.pop_front();
+        }
+        let (then, picture0, files0) = self.samples[0];
+        let secs = now.duration_since(then).as_secs_f64();
+        if secs < 0.05 {
+            return (0.0, 0.0);
+        }
+        let kbps = |from: u64, to: u64| to.saturating_sub(from) as f64 * 8.0 / 1000.0 / secs;
+        (kbps(picture0, picture_bytes), kbps(files0, file_bytes))
+    }
+}
+
+/// The most a file copy may send, in kbit/s, while the picture is being sent
+/// down the same path; 0 = no ceiling.
+///
+/// While the bitrate target sits at its maximum the path has shown no limit,
+/// and the copy runs as fast as its own flow control allows (a copy on a
+/// local network must not be held to the picture's few megabits). Once the
+/// path has shown a limit, the target is about what it carries: the copy gets
+/// what the picture is not using of it, and never less than half, so a busy
+/// picture slows a copy down but cannot stop it. The picture then gives up
+/// its part of the room in the usual way, through the bitrate control.
+fn file_ceiling(target_kbps: u32, path_limited: bool, picture_kbps: f64) -> u32 {
+    if !path_limited {
+        return 0;
+    }
+    let target = target_kbps as f64;
+    (target - picture_kbps).max(target * 0.5).max(150.0) as u32
+}
+
 /// Slowest pacing of a frame's datagrams, whatever the bitrate target: none.
 /// Pacing follows the target (see `Pacer::set_target`) all the way down, so
 /// that a full picture, a hundred or more datagrams, is never fired into a
@@ -1290,12 +1540,19 @@ fn stream_loop(
     link: &Arc<SecureLink>,
     rx: &mpsc::Receiver<Event>,
     target_kbps: &Arc<AtomicU32>,
+    target_reset: &AtomicU32,
     last_feedback_us: &Arc<AtomicU64>,
     end_session: &AtomicBool,
 ) -> anyhow::Result<SessionEnd> {
     tracing::info!("viewer authenticated; streaming");
     announce(link, &first)?;
     let announced = Instant::now();
+    // The stream description is not retransmitted by the link. After a
+    // change in the middle of a session it is said again a couple of times,
+    // so a viewer that missed it is not left decoding the wrong size.
+    let mut last_announce = Instant::now();
+    let mut announce_again = 0u8;
+    let mut sizes = SizeChooser::new(Instant::now());
 
     // `None` while the pipeline is being rebuilt (display switch, or the
     // desktop duplication was lost). The old one is dropped *before* a new
@@ -1307,7 +1564,7 @@ fn stream_loop(
     let mut keys = KeyframeGate::new();
     let mut frame_id = 0u32;
     let mut stats = Stats::default();
-    let mut current_kbps = cfg.bitrate_kbps;
+    let mut current_kbps = slot.as_ref().map_or(cfg.bitrate_kbps, |p| p.encoder.config().bitrate_kbps);
     let mut pacer = Pacer::new(current_kbps, PACE_FLOOR_KBPS);
     let frame_timeout = Duration::from_millis(1000 / cfg.fps.max(1) as u64 + 1);
 
@@ -1346,7 +1603,8 @@ fn stream_loop(
         }
 
         let Some(pipeline) = slot.as_mut() else {
-            match Pipeline::for_monitor(cfg, monitor) {
+            let kbps = target_kbps.load(Ordering::Relaxed).max(MIN_KBPS);
+            match Pipeline::for_monitor(cfg, monitor, sizes.step, kbps) {
                 Ok(p) => {
                     monitor = p.monitor_index;
                     injector.set_monitor(
@@ -1356,10 +1614,10 @@ fn stream_loop(
                         p.rect.bottom - p.rect.top,
                     );
                     announce(link, &p)?;
+                    last_announce = Instant::now();
+                    announce_again = 2;
                     tracing::info!(monitor, "capture pipeline (re)built");
-                    // A fresh encoder starts at the configured bitrate; the
-                    // adaptive target is re-applied on the next pass.
-                    current_kbps = cfg.bitrate_kbps;
+                    current_kbps = kbps;
                     pacer.set_target(current_kbps, PACE_FLOOR_KBPS);
                     // A new encoder starts with a full picture by itself.
                     keys = KeyframeGate::new();
@@ -1378,6 +1636,49 @@ fn stream_loop(
         };
 
         let want = target_kbps.load(Ordering::Relaxed);
+        // A smaller picture when the connection carries too little for this
+        // size, a larger one again when it has room.
+        if let Some(change) = sizes.update(want, pipeline.native, Instant::now()) {
+            // Where the bitrate control carries on from (see `SizeChange`).
+            let want = match change.target_kbps {
+                Some(kbps) => {
+                    let kbps = kbps.clamp(MIN_KBPS.min(cfg.bitrate_kbps), cfg.bitrate_kbps);
+                    target_kbps.store(kbps, Ordering::Relaxed);
+                    target_reset.store(kbps, Ordering::Relaxed);
+                    kbps
+                }
+                None => want,
+            };
+            match pipeline.resize(cfg, change.step, want.max(MIN_KBPS)) {
+                Ok(()) => {
+                    tracing::info!(
+                        width = pipeline.width,
+                        height = pipeline.height,
+                        screen_width = pipeline.native.0,
+                        screen_height = pipeline.native.1,
+                        target_kbps = want,
+                        "picture size changed to suit the connection"
+                    );
+                    current_kbps = want.max(MIN_KBPS);
+                    pacer.set_target(current_kbps, PACE_FLOOR_KBPS);
+                    // A new encoder starts with a full picture by itself.
+                    keys = KeyframeGate::new();
+                    announce(link, pipeline)?;
+                    last_announce = Instant::now();
+                    announce_again = 2;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = format_args!("{e:#}"), "the picture size could not be changed; keeping it");
+                    sizes.step = pipeline.size_step;
+                }
+            }
+        }
+        if announce_again > 0 && last_announce.elapsed() > Duration::from_millis(400) {
+            announce(link, pipeline)?;
+            last_announce = Instant::now();
+            announce_again -= 1;
+        }
         if want != current_kbps && p_set_bitrate(pipeline, want) {
             current_kbps = want;
             pacer.set_target(want, PACE_FLOOR_KBPS);
@@ -1425,7 +1726,8 @@ fn stream_loop(
 /// Tell the viewer what is being streamed and what this version understands.
 fn announce(link: &SecureLink, p: &Pipeline) -> std::io::Result<()> {
     link.send_control(&p.stream_info())?;
-    link.send_control(&ControlMessage::Features(FEATURE_INPUT_BATCH))
+    link.send_control(&ControlMessage::Features(FEATURE_INPUT_BATCH))?;
+    link.send_control(&ControlMessage::NativeSize { width: p.native.0, height: p.native.1 })
 }
 
 fn p_set_bitrate(p: &mut Pipeline, kbps: u32) -> bool {
@@ -1517,5 +1819,136 @@ impl Stats {
             );
         }
         *self = Stats { last: Some(now), last_frame: self.last_frame, ..Default::default() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FULL_HD: (u32, u32) = (1920, 1080);
+
+    /// Feed the same target every 100 ms for `secs`; the step changes seen.
+    fn hold(c: &mut SizeChooser, t: &mut Instant, kbps: u32, secs: f64) -> Vec<usize> {
+        let mut seen = Vec::new();
+        for _ in 0..(secs * 10.0) as u32 {
+            *t += Duration::from_millis(100);
+            seen.extend(c.update(kbps, FULL_HD, *t).map(|change| change.step));
+        }
+        seen
+    }
+
+    #[test]
+    fn a_larger_size_that_does_not_hold_is_tried_less_and_less_often() {
+        let mut t = Instant::now();
+        let mut c = SizeChooser::new(t);
+        assert_eq!(hold(&mut c, &mut t, 800, 3.0), vec![2]);
+        // The target drifts up (a quiet screen), the size follows, and the
+        // path turns out not to carry it: down again. How long each trial
+        // takes to come round:
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            let mut waited = 0.0;
+            while hold(&mut c, &mut t, 2000, 1.0).is_empty() {
+                waited += 1.0;
+                assert!(waited < 400.0);
+            }
+            waits.push(waited);
+            assert_eq!(hold(&mut c, &mut t, 500, 3.0), vec![2]);
+        }
+        assert!(waits.windows(2).all(|w| w[1] > w[0] * 1.5), "{waits:?}");
+        // A larger size that holds puts the wait back to normal.
+        while hold(&mut c, &mut t, 2000, 1.0).is_empty() {}
+        assert!(hold(&mut c, &mut t, 1500, 60.0).is_empty());
+        assert_eq!(c.up_wait[1], SizeChooser::SETTLE);
+        // From there, full size is tried, fails, and costs one step only;
+        // three quarters, which has held, is not made to wait for it.
+        let mut waited = 0.0;
+        while hold(&mut c, &mut t, 4000, 1.0).is_empty() {
+            waited += 1.0;
+        }
+        assert_eq!(c.step, 0);
+        assert_eq!(hold(&mut c, &mut t, 400, 1.5), vec![1], "back to the size before the trial, and quickly");
+        assert!(c.up_wait[0] > SizeChooser::SETTLE && c.up_wait[1] == SizeChooser::SETTLE);
+        assert!(waited < 12.0);
+    }
+
+    #[test]
+    fn a_file_copy_gets_what_the_picture_leaves() {
+        // No limit seen on the path: no ceiling.
+        assert_eq!(file_ceiling(8000, false, 6000.0), 0);
+        // A limited path and a still screen: the whole target.
+        assert_eq!(file_ceiling(2000, true, 0.0), 2000);
+        // A busy picture: half, not nothing.
+        assert_eq!(file_ceiling(2000, true, 1900.0), 1000);
+        assert_eq!(file_ceiling(2000, true, 600.0), 1400);
+        assert_eq!(file_ceiling(200, true, 200.0), 150);
+    }
+
+    #[test]
+    fn send_rates_follow_the_totals() {
+        let mut r = SendRates::default();
+        let t = Instant::now();
+        assert_eq!(r.rates(t, 0, 0), (0.0, 0.0));
+        // 125 kB and 25 kB in each 100 ms: 10 and 2 Mbit/s.
+        let mut last = (0.0, 0.0);
+        for i in 1..=20u64 {
+            last = r.rates(t + Duration::from_millis(100 * i), 125_000 * i, 25_000 * i);
+        }
+        assert!((last.0 - 10_000.0).abs() < 1.0 && (last.1 - 2_000.0).abs() < 1.0, "{last:?}");
+        // The copy ends: within the window its rate is back to nothing.
+        for i in 21..=30u64 {
+            last = r.rates(t + Duration::from_millis(100 * i), 125_000 * i, 25_000 * 20);
+        }
+        assert!(last.1 < 1.0, "{last:?}");
+    }
+
+    #[test]
+    fn sizes_are_even_and_in_proportion() {
+        assert_eq!(stepped_size(FULL_HD, 0), (1920, 1080));
+        assert_eq!(stepped_size(FULL_HD, 1), (1440, 810));
+        assert_eq!(stepped_size(FULL_HD, 2), (960, 540));
+        assert_eq!(stepped_size((1366, 768), 1), (1024, 576));
+        let (w, h) = stepped_size((1365, 767), 2);
+        assert!(w % 2 == 0 && h % 2 == 0);
+    }
+
+    #[test]
+    fn a_fast_connection_keeps_the_full_size() {
+        let mut t = Instant::now();
+        let mut c = SizeChooser::new(t);
+        assert!(hold(&mut c, &mut t, 4000, 30.0).is_empty());
+        // About what a 3 Mbit/s connection settles at: still full size.
+        assert!(hold(&mut c, &mut t, 2300, 30.0).is_empty());
+    }
+
+    #[test]
+    fn a_slow_connection_gets_a_smaller_picture_and_a_passing_dip_does_not() {
+        let mut t = Instant::now();
+        let mut c = SizeChooser::new(t);
+        // One second at a low target, then back up: nothing changes.
+        assert!(hold(&mut c, &mut t, 800, 1.0).is_empty());
+        assert!(hold(&mut c, &mut t, 4000, 1.0).is_empty());
+        // 1.2 Mbit/s that stays: three quarters. 0.8 Mbit/s: half.
+        assert_eq!(hold(&mut c, &mut t, 1200, 5.0), vec![1]);
+        assert_eq!(hold(&mut c, &mut t, 800, 5.0), vec![2]);
+        // Nothing smaller than half, however slow.
+        assert!(hold(&mut c, &mut t, 300, 20.0).is_empty());
+    }
+
+    #[test]
+    fn the_size_comes_back_slowly_and_only_with_room_to_spare() {
+        let mut t = Instant::now();
+        let mut c = SizeChooser::new(t);
+        // 0.8 Mbit/s is too little even for three quarters: straight to half.
+        assert_eq!(hold(&mut c, &mut t, 800, 3.0), vec![2]);
+        assert!(hold(&mut c, &mut t, 800, 3.0).is_empty());
+        // Just above what three quarters needs is not enough to go back.
+        assert!(hold(&mut c, &mut t, 1150, 30.0).is_empty());
+        // Comfortably above: back one step, not at once, then the next.
+        assert!(hold(&mut c, &mut t, 6000, 5.0).is_empty());
+        assert_eq!(hold(&mut c, &mut t, 6000, 4.0), vec![1]);
+        assert!(hold(&mut c, &mut t, 6000, 6.0).is_empty());
+        assert_eq!(hold(&mut c, &mut t, 6000, 4.0), vec![0]);
     }
 }

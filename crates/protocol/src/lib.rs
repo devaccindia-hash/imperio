@@ -101,6 +101,14 @@ pub enum ControlMessage {
     InputAck {
         seq: u32,
     },
+    /// The size of the screen being shown, in its own pixels. `StreamInfo`
+    /// carries the size of the picture as sent, which is smaller while the
+    /// connection is slow; the viewer needs both so that "actual size" and
+    /// the zoom steps keep meaning the same thing. Sent after `StreamInfo`.
+    NativeSize {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// The host understands [`ControlMessage::InputBatch`].

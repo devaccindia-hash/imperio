@@ -1514,11 +1514,24 @@ fn heart(ui: &mut egui::Ui, size: f32, color: Color32) {
     ));
 }
 
+/// The logo beside the name, in the plan's colour.
 fn logo(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(7), accent());
-    p.circle_filled(rect.center(), size * 0.18, Color32::WHITE);
+    let rgb = ACCENT_RGB.load(Ordering::Relaxed);
+    let id = egui::Id::unique(("imperio-logo", rgb));
+    let cached = ui.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(id));
+    let texture = cached.unwrap_or_else(|| {
+        const N: usize = 128;
+        let image = egui::ColorImage::from_rgba_unmultiplied([N, N], &imperio_ui::logo::rgba(N as u32, rgb));
+        let texture = ui.ctx().load_texture("imperio-logo", image, egui::TextureOptions::LINEAR);
+        ui.ctx().data_mut(|d| d.insert_temp(id, texture.clone()));
+        texture
+    });
+    // The drawing keeps a margin inside its picture; show it a little larger
+    // so the coloured square itself is `size` across.
+    let shown = rect.expand(size * 4.0 / 56.0);
+    let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    ui.painter().image(texture.id(), shown, whole, Color32::WHITE);
 }
 
 /// Switch with a label and a one-line explanation. Returns true when toggled.
@@ -1628,27 +1641,10 @@ pub(crate) fn icon_for(pro: bool) -> egui::IconData {
     icon(if pro { PRO_ACCENT } else { FREE_ACCENT })
 }
 
-/// Window / taskbar / tray icon: rounded square in `rgb` with a white dot.
+/// Window / taskbar / tray icon: the logo on a square of colour `rgb`.
 fn icon(rgb: u32) -> egui::IconData {
-    let (r, g, b) = ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
-    let n = 64usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    for y in 0..n {
-        for x in 0..n {
-            let (fx, fy) = (x as f32 - 31.5, y as f32 - 31.5);
-            let inside = fx.abs() < 28.0
-                && fy.abs() < 28.0
-                && (fx.abs() < 20.0 || fy.abs() < 20.0 || (fx.abs() - 20.0).hypot(fy.abs() - 20.0) < 8.0);
-            let i = (y * n + x) * 4;
-            if inside {
-                rgba[i..i + 4].copy_from_slice(&[r, g, b, 0xFF]);
-            }
-            if (fx * fx + fy * fy).sqrt() < 9.0 {
-                rgba[i..i + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-            }
-        }
-    }
-    egui::IconData { rgba, width: n as u32, height: n as u32 }
+    const N: u32 = 64;
+    egui::IconData { rgba: imperio_ui::logo::rgba(N, rgb), width: N, height: N }
 }
 
 // ------------------------------------------------------------------ helpers

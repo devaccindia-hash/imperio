@@ -21,10 +21,17 @@ pub struct Renderer {
     swapchain: IDXGISwapChain1,
     width: u32,
     height: u32,
+    /// Size of the picture as it arrives.
     source: Option<(u32, u32)>,
+    /// Size of the other screen itself, when the other computer has said it:
+    /// larger than `source` while a slow connection gets a smaller picture.
+    /// Zoom and positions are in these pixels, so neither jumps when the
+    /// picture changes size.
+    native: Option<(u32, u32)>,
     converter: Option<Converter>,
     dest: RECT,
-    /// The part of the source picture shown (all of it unless zoomed in).
+    /// The part of the other screen shown (all of it unless zoomed in), in
+    /// that screen's pixels.
     src: RECT,
     cropped: bool,
     zoom: Option<f64>,
@@ -69,6 +76,7 @@ impl Renderer {
             width: size.width.max(1),
             height: size.height.max(1),
             source: None,
+            native: None,
             converter: None,
             dest: RECT::default(),
             src: RECT::default(),
@@ -87,7 +95,28 @@ impl Renderer {
 
     pub fn set_source_size(&mut self, w: u32, h: u32) {
         self.source = Some((w, h));
+        // A picture of the old size cannot be drawn with the new converter.
+        self.last = None;
         self.rebuild();
+    }
+
+    /// The other screen's own size (see `native`).
+    pub fn set_native_size(&mut self, w: u32, h: u32) {
+        if w > 0 && h > 0 && self.native != Some((w, h)) {
+            self.native = Some((w, h));
+            self.layout();
+            self.redraw();
+        }
+    }
+
+    /// The other screen's size: what it said, or else the picture's.
+    fn screen(&self) -> Option<(u32, u32)> {
+        self.native.or(self.source)
+    }
+
+    /// The picture arrives smaller than the other screen is.
+    pub fn reduced(&self) -> bool {
+        matches!((self.source, self.native), (Some((sw, _)), Some((nw, _))) if sw < nw)
     }
 
     pub fn resize(&mut self, w: u32, h: u32) -> anyhow::Result<()> {
@@ -121,7 +150,7 @@ impl Renderer {
 
     /// Window pixels per pixel of the other screen, as shown right now.
     pub fn scale(&self) -> f64 {
-        let Some((sw, sh)) = self.source else { return 1.0 };
+        let Some((sw, sh)) = self.screen() else { return 1.0 };
         self.zoom.unwrap_or_else(|| (self.width as f64 / sw as f64).min(self.height as f64 / sh as f64))
     }
 
@@ -140,7 +169,7 @@ impl Renderer {
 
     /// A window position as a position on the other screen, 0..=1 each way.
     pub fn to_source(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        let (sw, sh) = self.source?;
+        let (sw, sh) = self.screen()?;
         let (d, s) = (self.dest, self.src);
         let fx = (x - d.left as f64) / (d.right - d.left).max(1) as f64;
         let fy = (y - d.top as f64) / (d.bottom - d.top).max(1) as f64;
@@ -161,7 +190,7 @@ impl Renderer {
 
     /// Which part of the picture goes where in the window.
     fn layout(&mut self) {
-        let Some((sw, sh)) = self.source else { return };
+        let (Some((sw, sh)), Some((pw, ph))) = (self.screen(), self.source) else { return };
         let (ww, wh) = (self.width as f64, self.height as f64);
         let scale = self.scale();
         // One axis at a time: what fits is centred, what does not is cropped
@@ -183,7 +212,16 @@ impl Renderer {
         self.dest = RECT { left: dx0 as i32, top: dy0 as i32, right: dx1 as i32, bottom: dy1 as i32 };
         self.cropped = self.src.right - self.src.left < sw as i32 || self.src.bottom - self.src.top < sh as i32;
         if let Some(c) = &self.converter {
-            c.set_source_rect(self.cropped.then_some(self.src));
+            // The converter cuts from the picture as it arrived, which may
+            // be smaller than the screen it shows.
+            let (fx, fy) = (pw as f64 / sw as f64, ph as f64 / sh as f64);
+            let part = RECT {
+                left: (self.src.left as f64 * fx).round() as i32,
+                top: (self.src.top as f64 * fy).round() as i32,
+                right: ((self.src.right as f64 * fx).round() as i32).min(pw as i32),
+                bottom: ((self.src.bottom as f64 * fy).round() as i32).min(ph as i32),
+            };
+            c.set_source_rect(self.cropped.then_some(part));
             c.set_dest_rect(Some(self.dest));
         }
     }

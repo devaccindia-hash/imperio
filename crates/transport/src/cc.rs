@@ -42,6 +42,9 @@ pub struct BitrateController {
     queue_at_decrease: f64,
     /// No overload seen yet: the target climbs quickly towards the maximum.
     starting: bool,
+    /// What else this side is sending down the same path (a file copy), in
+    /// kbit/s: see [`BitrateController::set_other_load`].
+    other_kbps: f64,
 }
 
 impl BitrateController {
@@ -57,7 +60,32 @@ impl BitrateController {
             last_decrease: now,
             queue_at_decrease: 0.0,
             starting: true,
+            other_kbps: 0.0,
         }
+    }
+
+    /// Tell the controller how much else this side is sending down the same
+    /// path. A file copy that fills the path without loss or delay shows that
+    /// the path carries it, exactly as a busy picture would: without this the
+    /// target could never rise again while the screen is quiet, and the copy
+    /// (which is held to a share of the target) would stay slow on a path
+    /// that has long recovered.
+    pub fn set_other_load(&mut self, kbps: f64) {
+        self.other_kbps = kbps.max(0.0);
+    }
+
+    /// Continue from `kbps`: what is being sent has changed (another picture
+    /// size), and the target reached before says little about it. The
+    /// target stays put for a moment, as after a cut.
+    pub fn set_target(&mut self, kbps: u32, now: Instant) {
+        self.target_kbps = kbps.clamp(self.min_kbps, self.max_kbps);
+        self.last_increase = now;
+        self.last_decrease = now;
+    }
+
+    /// The target is below the maximum: the path has shown a limit.
+    pub fn limited(&self) -> bool {
+        self.target_kbps < self.max_kbps
     }
 
     pub fn target_kbps(&self) -> u32 {
@@ -96,12 +124,20 @@ impl BitrateController {
         // matters when heavy, so random lossy links are not starved.
         let loss = if total == 0 { 0.0 } else { d_lost as f64 / total as f64 };
         let raw_loss = d_missing as f64 / (d_recv + d_missing).max(1) as f64;
-        let queue_ms = r.queue_delay_us as f64 / 1000.0;
+        // The delay in a report is measured on the picture's datagrams. When
+        // none arrived since the last report (a still screen) the figure is
+        // the old one repeated: it must not be read as a queue that is still
+        // there, or the target is cut again and again while nothing is sent.
+        let queue_ms = if d_recv > 0 { r.queue_delay_us as f64 / 1000.0 } else { 0.0 };
         let rates = self.rates(now);
         let target = self.target_kbps as f64;
-        // The stream is using a good part of the target, so what the path
+        // The picture is using a good part of the target, so what the path
         // does to it says something about the path.
-        let busy = rates.is_some_and(|(sent, _)| sent >= target * 0.4);
+        let media_busy = rates.is_some_and(|(sent, _)| sent >= target * 0.4);
+        // The same, counting what else is being sent: enough to say the path
+        // carries the target, not enough to say how much of the picture it
+        // dropped.
+        let busy = media_busy || rates.map_or(0.0, |(sent, _)| sent) + self.other_kbps >= target * 0.4;
 
         let old = self.target_kbps;
         let overloaded = loss > 0.02 || raw_loss > 0.15 || queue_ms > 60.0;
@@ -117,7 +153,7 @@ impl BitrateController {
                 let mut next = target * 0.8;
                 // What arrived while the path was overloaded is what the
                 // path carries: aim a little under it.
-                if let (true, Some((_, arrived))) = (busy, rates) {
+                if let (true, Some((_, arrived))) = (media_busy, rates) {
                     next = next.min(arrived * 0.85);
                 }
                 self.target_kbps = next as u32;
@@ -125,7 +161,7 @@ impl BitrateController {
                 self.queue_at_decrease = queue_ms;
                 self.starting = false;
             }
-        } else if total > 0 && busy && loss < 0.01 && queue_ms < 15.0 {
+        } else if (total > 0 || self.other_kbps >= target * 0.4) && busy && loss < 0.01 && queue_ms < 15.0 {
             let (every, factor) = if self.starting {
                 (Duration::from_millis(250), 1.25)
             } else {
@@ -248,6 +284,66 @@ mod tests {
         }
         let after = s.cc.target_kbps();
         assert!(after > low && (after as f64) < low as f64 * 1.3, "careful growth: {low} -> {after}");
+    }
+
+    #[test]
+    fn a_file_copy_counts_as_use_of_the_path() {
+        // Cut to half by an overload, then a quiet screen: the target stays.
+        let mut s = Sim::new(8000, 500, 8000);
+        for _ in 0..8 {
+            s.step(8000, 8000, 0);
+        }
+        for _ in 0..6 {
+            s.step(8000, 4000, 120);
+        }
+        let low = s.cc.target_kbps();
+        assert!(low < 4000 && s.cc.limited(), "target {low}");
+        for _ in 0..40 {
+            s.step(100, 100, 0);
+        }
+        assert_eq!(s.cc.target_kbps(), low);
+        // A file copy now fills the path without loss or delay: the target
+        // climbs back, all the way to the maximum.
+        for _ in 0..120 {
+            let t = s.cc.target_kbps() as f64;
+            s.cc.set_other_load(t);
+            s.step(100, 100, 0);
+        }
+        assert_eq!(s.cc.target_kbps(), 8000);
+        assert!(!s.cc.limited());
+        // An overload during the copy with a quiet screen is an ordinary
+        // cut, not a fall to the little the picture was sending.
+        s.cc.set_other_load(8000.0);
+        s.step(100, 100, 150);
+        s.step(100, 100, 150);
+        s.step(100, 100, 150);
+        let t = s.cc.target_kbps();
+        assert!((4000..8000).contains(&t), "target {t}");
+    }
+
+    #[test]
+    fn a_still_screen_after_an_overload_does_not_keep_cutting() {
+        let mut s = Sim::new(8000, 500, 8000);
+        for _ in 0..8 {
+            s.step(8000, 8000, 0);
+        }
+        for _ in 0..4 {
+            s.step(8000, 4000, 120);
+        }
+        let low = s.cc.target_kbps();
+        // The screen stops changing: nothing is sent, and every report
+        // repeats the last delay that was measured.
+        for _ in 0..50 {
+            s.step(0, 0, 120);
+        }
+        assert_eq!(s.cc.target_kbps(), low, "no new measurement, no new cut");
+        // A file copy with a still screen still lets the target recover.
+        for _ in 0..120 {
+            let t = s.cc.target_kbps() as f64;
+            s.cc.set_other_load(t);
+            s.step(0, 0, 120);
+        }
+        assert_eq!(s.cc.target_kbps(), 8000);
     }
 
     #[test]

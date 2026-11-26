@@ -14,10 +14,10 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, SetWindowSubclass, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CheckMenuItem, CheckMenuRadioItem, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, ModifyMenuW,
-    SetMenu, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, DM_GETDEFID, ES_AUTOHSCROLL, HMENU, IDCANCEL,
-    IDOK, MF_BYCOMMAND, MF_BYPOSITION, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_DROPFILES, WS_BORDER, WS_TABSTOP,
+    AppendMenuW, CheckMenuItem, CheckMenuRadioItem, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, EnableMenuItem,
+    ModifyMenuW, SetMenu, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, DM_GETDEFID, ES_AUTOHSCROLL, HMENU, IDCANCEL, IDOK,
+    MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SC_KEYMENU,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DROPFILES, WM_SYSCOMMAND, WS_BORDER, WS_TABSTOP,
 };
 
 // ---------------------------------------------------------------- connect
@@ -188,6 +188,8 @@ pub enum UiCmd {
     ToggleFullscreen,
     SelectDisplay(u8),
     ToggleRecording,
+    /// Session > Windows key and Alt+Tab go to the other computer.
+    ToggleSystemKeys,
     About,
 }
 
@@ -195,6 +197,7 @@ const ID_DISCONNECT: u16 = 1001;
 const ID_FULLSCREEN: u16 = 1002;
 const ID_RECORD: u16 = 1003;
 const ID_FILES: u16 = 1004;
+const ID_SYSTEM_KEYS: u16 = 1005;
 const ID_ZOOM_IN: u16 = 1301;
 const ID_ZOOM_OUT: u16 = 1302;
 /// "Fit to window", followed by one id per entry of [`ZOOM_PERCENTS`].
@@ -254,12 +257,19 @@ impl SessionMenu {
             let session = CreatePopupMenu().ok()?;
             AppendMenuW(session, MF_STRING, ID_FULLSCREEN as usize, &HSTRING::from("Full screen\tF11")).ok()?;
             AppendMenuW(session, MF_STRING, ID_RECORD as usize, &HSTRING::from("Start recording")).ok()?;
+            AppendMenuW(
+                session,
+                MF_STRING | MF_CHECKED,
+                ID_SYSTEM_KEYS as usize,
+                &HSTRING::from("Windows key and Alt+Tab go to the other computer"),
+            )
+            .ok()?;
             AppendMenuW(session, MF_SEPARATOR, 0, None).ok()?;
             AppendMenuW(session, MF_STRING, ID_DISCONNECT as usize, &HSTRING::from("Disconnect")).ok()?;
             let displays = CreatePopupMenu().ok()?;
             AppendMenuW(displays, MF_STRING, ID_DISPLAY_BASE as usize, &HSTRING::from("Display 1\tCtrl+Shift+1")).ok()?;
             let files = CreatePopupMenu().ok()?;
-            AppendMenuW(files, MF_STRING, ID_FILES as usize, &HSTRING::from("Browse and transfer files{2026}")).ok()?;
+            AppendMenuW(files, MF_STRING, ID_FILES as usize, &HSTRING::from("Browse and transfer files\u{2026}")).ok()?;
             AppendMenuW(files, MF_SEPARATOR, 0, None).ok()?;
             AppendMenuW(
                 files,
@@ -343,6 +353,24 @@ impl SessionMenu {
         }
     }
 
+    /// Tick or clear "Windows key and Alt+Tab go to the other computer".
+    pub fn set_system_keys(&self, on: bool) {
+        let state = if on { MF_CHECKED } else { MF_UNCHECKED };
+        // SAFETY: live menu owned by our window, used on its thread.
+        unsafe {
+            let _ = CheckMenuItem(self.session, ID_SYSTEM_KEYS as u32, MF_BYCOMMAND.0 | state.0);
+        }
+    }
+
+    /// Grey the item out in a view-only session, where no key is sent at all.
+    pub fn disable_system_keys(&self) {
+        // SAFETY: as above.
+        unsafe {
+            let _ = CheckMenuItem(self.session, ID_SYSTEM_KEYS as u32, MF_BYCOMMAND.0 | MF_UNCHECKED.0);
+            let _ = EnableMenuItem(self.session, ID_SYSTEM_KEYS as u32, MF_BYCOMMAND | MF_GRAYED);
+        }
+    }
+
     /// Tick the current zoom in the View menu: `None` = fit to window,
     /// otherwise a percentage (only the listed ones get a tick).
     pub fn set_zoom(&self, percent: Option<u16>) {
@@ -400,6 +428,12 @@ unsafe extern "system" fn subclass_proc(
         }
         return LRESULT(0);
     }
+    // Alt on its own (or F10) would move the keyboard into this window's
+    // menu bar: the next keys would open menus here instead of reaching the
+    // other computer. The menus are for the mouse.
+    if msg == WM_SYSCOMMAND && (w.0 & 0xFFF0) as u32 == SC_KEYMENU {
+        return LRESULT(0);
+    }
     // Menu commands arrive with the high word of WPARAM == 0.
     if msg == WM_COMMAND && (w.0 >> 16) & 0xFFFF == 0 {
         let id = ui::loword(w);
@@ -407,6 +441,7 @@ unsafe extern "system" fn subclass_proc(
             ID_DISCONNECT => Some(UiCmd::Disconnect),
             ID_FULLSCREEN => Some(UiCmd::ToggleFullscreen),
             ID_RECORD => Some(UiCmd::ToggleRecording),
+            ID_SYSTEM_KEYS => Some(UiCmd::ToggleSystemKeys),
             ID_FILES => Some(UiCmd::Files),
             ID_ZOOM_IN => Some(UiCmd::Zoom(Zoom::In)),
             ID_ZOOM_OUT => Some(UiCmd::Zoom(Zoom::Out)),
@@ -435,6 +470,8 @@ pub fn about_text() -> String {
          F11 \u{2014} toggle full screen\n\
          Ctrl+Shift+Plus / Minus \u{2014} zoom in / out; Ctrl+Shift+0 \u{2014} fit to window (also in the View menu)\n\
          Ctrl+Shift+1..9 \u{2014} switch the host display\n\
+         The Windows key, Alt+Tab, Alt+Esc and Ctrl+Esc go to the other computer while this window is in front \
+         (Session menu to switch that off). Ctrl+Alt+Del and Windows+L always stay with this computer.\n\
          Session > Start recording saves the session as an MP4 in Videos\\Imperio.\n\
          Files > Browse and transfer files opens both computers side by side.\n\
          Drop files on this window to send them to the other computer\u{2019}s Desktop.\n\

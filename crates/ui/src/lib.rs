@@ -7,6 +7,8 @@
 //! tray icon) so `apps/host/src/ui.rs` and `apps/viewer/src/ui.rs` can read
 //! like layout code.
 
+pub mod logo;
+
 use windows::core::{Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -97,6 +99,17 @@ pub fn ui_font(points: i32, bold: bool) -> HFONT {
     }
 }
 
+/// The program's own icon (the logo, put into each `.exe` when it is built);
+/// the stock application icon in a program built without it.
+pub fn app_icon() -> HICON {
+    // SAFETY: a resource id in place of a name is how numbered icons are loaded.
+    unsafe {
+        LoadIconW(Some(hinstance()), PCWSTR(logo::ICON_RESOURCE_ID as usize as *const u16))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default()
+    }
+}
+
 /// Register a top-level window class with `proc`. Idempotent per name.
 pub fn register_class(name: &str, proc: WNDPROC) -> Vec<u16> {
     let class = wide(name);
@@ -108,6 +121,7 @@ pub fn register_class(name: &str, proc: WNDPROC) -> Vec<u16> {
             lpfnWndProc: proc,
             hInstance: hinstance(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hIcon: app_icon(),
             hbrBackground: HBRUSH(GetStockObject(WHITE_BRUSH).0),
             lpszClassName: PCWSTR(class.as_ptr()),
             ..Default::default()
@@ -289,8 +303,7 @@ impl TrayIcon {
             uID: 1,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: callback,
-            // SAFETY: stock icon load.
-            hIcon: icon.unwrap_or_else(|| unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() }),
+            hIcon: icon.unwrap_or_else(app_icon),
             ..Default::default()
         };
         for (i, c) in tip.encode_utf16().take(127).enumerate() {

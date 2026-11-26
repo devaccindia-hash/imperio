@@ -17,7 +17,7 @@
 //! floor, which is what keeps a large copy from pushing the picture aside.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,13 @@ const START_CWND: f64 = 32.0;
 const MAX_CWND: f64 = 2048.0;
 /// Datagrams sent per lock hold, so the receive thread is never kept waiting.
 const BURST: usize = 32;
+/// What one segment costs on the wire, for pacing: its payload plus the
+/// stream, link and UDP/IP headers around it.
+const SEGMENT_COST: f64 = (SEGMENT_BYTES + 70) as f64;
+/// Segments that may leave back to back after a pause.
+const PACE_BURST: f64 = 6.0;
+/// Round trip assumed for pacing before one has been measured.
+const UNKNOWN_RTT: f64 = 0.05;
 
 const DATA_HEADER: usize = 9;
 const ACK_LEN: usize = 18;
@@ -100,6 +107,9 @@ struct Tx {
     last_delay_backoff: Instant,
     last_send: Instant,
     retransmits: u64,
+    /// Pacing: bytes that may be sent now, and when that was last worked out.
+    tokens: f64,
+    tokens_at: Instant,
 }
 
 impl Tx {
@@ -108,6 +118,37 @@ impl Tx {
             Some(s) => Duration::from_secs_f64((s * 2.0 + 0.02).clamp(0.06, 2.0)),
             None => Duration::from_millis(300),
         }
+    }
+
+    /// Bytes per second the stream may send right now.
+    ///
+    /// A window says how much may be on its way, not how fast it leaves:
+    /// sent in one burst it lands in the queue in front of the slowest part
+    /// of the path, where the picture and the keyboard wait behind it. So the
+    /// window is spread over a round trip (a little faster, to let it grow).
+    /// `limit_kbps`, when not zero, is a ceiling from outside: the share of
+    /// the connection the picture leaves for files (see [`Reliable::set_rate_limit`]).
+    fn pace(&self, limit_kbps: u32) -> f64 {
+        let rtt = self.srtt.unwrap_or(UNKNOWN_RTT).max(0.001);
+        let by_window = self.cwnd * SEGMENT_COST / rtt * 1.25;
+        if limit_kbps == 0 {
+            by_window
+        } else {
+            by_window.min(limit_kbps as f64 * 125.0)
+        }
+    }
+
+    /// How many segments pacing lets out now.
+    fn paced_segments(&mut self, limit_kbps: u32, now: Instant) -> usize {
+        let rate = self.pace(limit_kbps);
+        let dt = now.duration_since(self.tokens_at).as_secs_f64();
+        self.tokens_at = now;
+        // What may pile up while this thread sleeps: a few segments, or at a
+        // high rate what 20 ms carry (a sleep on Windows can last 15 ms, and
+        // a fast path must not be held to a few segments per sleep).
+        let most = (PACE_BURST * SEGMENT_COST).max(rate * 0.02);
+        self.tokens = (self.tokens + dt * rate).min(most);
+        (self.tokens / SEGMENT_COST) as usize
     }
 
     fn on_loss(&mut self, seq: u64) {
@@ -143,6 +184,12 @@ struct Inner {
     /// Bytes of complete messages waiting in the inbox.
     pending: AtomicUsize,
     closed: AtomicBool,
+    /// See [`Reliable::set_rate_limit`]; 0 = none.
+    limit_kbps: AtomicU32,
+    /// Segments queued or on their way and not yet acknowledged.
+    unsent: AtomicUsize,
+    /// Bytes of data segments put on the wire so far (repeats included).
+    sent_bytes: AtomicU64,
 }
 
 /// Sending half and datagram entry point. Cheap to clone.
@@ -188,6 +235,8 @@ impl Reliable {
                 last_delay_backoff: now,
                 last_send: now,
                 retransmits: 0,
+                tokens: PACE_BURST * SEGMENT_COST,
+                tokens_at: now,
             }),
             wake: Condvar::new(),
             space: Condvar::new(),
@@ -202,6 +251,9 @@ impl Reliable {
             }),
             pending: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            limit_kbps: AtomicU32::new(0),
+            unsent: AtomicUsize::new(0),
+            sent_bytes: AtomicU64::new(0),
         });
         let pump = inner.clone();
         std::thread::Builder::new()
@@ -240,9 +292,34 @@ impl Reliable {
             tx.queue_bytes += body.len();
             tx.queue.push_back(Bytes::from(body));
         }
+        inner.unsent.store(tx.queue.len() + tx.window.len(), Ordering::Relaxed);
         drop(tx);
         inner.wake.notify_one();
         Ok(())
+    }
+
+    /// Keep the stream's sending rate under `kbps` (0 = no ceiling). Set by
+    /// the side that also sends the picture, from what the connection is
+    /// known to carry, so that a file copy shares it instead of pushing the
+    /// picture aside.
+    pub fn set_rate_limit(&self, kbps: u32) {
+        self.inner.limit_kbps.store(kbps, Ordering::Relaxed);
+    }
+
+    /// Bytes of data put on the wire so far, headers included: with the
+    /// time, how fast the stream is sending.
+    pub fn sent_bytes(&self) -> u64 {
+        self.inner.sent_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn rate_limit(&self) -> u32 {
+        self.inner.limit_kbps.load(Ordering::Relaxed)
+    }
+
+    /// More than a few segments are waiting to be sent or acknowledged: a
+    /// transfer is under way (a listing or a request is only a few).
+    pub fn busy(&self) -> bool {
+        self.inner.unsent.load(Ordering::Relaxed) > 16
     }
 
     /// Feed one stream datagram from the link (`Incoming::Stream`).
@@ -427,6 +504,7 @@ impl Inner {
         }
         tx.base = cum;
         tx.rwnd = rwnd as u32;
+        self.unsent.store(tx.queue.len() + tx.window.len(), Ordering::Relaxed);
 
         // Selective acks: note what arrived, and treat a segment as lost once
         // three later ones have.
@@ -508,10 +586,15 @@ impl Inner {
             let now = Instant::now();
             let rto = tx.rto();
             let mut burst: Vec<Bytes> = Vec::new();
+            // What pacing lets out in this pass (see `Tx::pace`).
+            let room = tx.paced_segments(self.limit_kbps.load(Ordering::Relaxed), now).min(BURST);
 
             // 1. Segments to send again: marked lost, or unanswered too long.
             let mut timed_out = None;
             for (i, seg) in tx.window.iter_mut().enumerate() {
+                if burst.len() >= room {
+                    break;
+                }
                 if seg.sacked {
                     continue;
                 }
@@ -524,9 +607,6 @@ impl Inner {
                     seg.sent = now;
                     seg.retx = seg.retx.saturating_add(1);
                     burst.push(seg.body.clone());
-                    if burst.len() >= BURST {
-                        break;
-                    }
                 }
             }
             tx.retransmits += burst.len() as u64;
@@ -540,7 +620,7 @@ impl Inner {
             if allowed == 0 && tx.window.is_empty() && now.duration_since(tx.last_send) > Duration::from_millis(200) {
                 allowed = 1; // probe a closed window in case its reopening was lost
             }
-            while burst.len() < BURST && tx.window.len() < allowed {
+            while burst.len() < room && tx.window.len() < allowed {
                 let Some(body) = tx.queue.pop_front() else { break };
                 tx.queue_bytes -= body.len();
                 burst.push(body.clone());
@@ -552,6 +632,8 @@ impl Inner {
 
             if !burst.is_empty() {
                 tx.last_send = now;
+                tx.tokens -= burst.len() as f64 * SEGMENT_COST;
+                self.sent_bytes.fetch_add((burst.len() as f64 * SEGMENT_COST) as u64, Ordering::Relaxed);
                 drop(tx);
                 for body in burst {
                     let _ = self.wire.send_stream(false, &body);
@@ -563,6 +645,10 @@ impl Inner {
                 Duration::from_millis(2)
             } else if idle {
                 Duration::from_millis(50)
+            } else if room == 0 {
+                // Held back by pacing: until the next segment may go.
+                let rate = tx.pace(self.limit_kbps.load(Ordering::Relaxed)).max(1.0);
+                Duration::from_secs_f64(((SEGMENT_COST - tx.tokens) / rate).clamp(0.001, 0.005))
             } else {
                 Duration::from_millis(5)
             };
@@ -684,6 +770,53 @@ mod tests {
             assert!(got == big);
             std::thread::sleep(Duration::from_millis(50));
         }
+        sender.join().unwrap().close();
+        b.close();
+    }
+
+    #[test]
+    fn a_rate_limit_is_kept() {
+        // 2 MB under a ceiling of 4 Mbit/s (500 kB/s) takes about 4 seconds;
+        // without the ceiling this wire carries it in a fraction of one.
+        let ((a, _a_in), (b, b_in)) = pair(0.0);
+        a.set_rate_limit(4000);
+        let block = vec![7u8; 100_000];
+        let t0 = Instant::now();
+        let sender = std::thread::spawn(move || {
+            for _ in 0..20 {
+                a.send(&block).unwrap();
+            }
+            a
+        });
+        for _ in 0..20 {
+            b_in.recv_timeout(Duration::from_secs(30)).expect("message arrives");
+        }
+        let took = t0.elapsed().as_secs_f64();
+        assert!((3.2..7.0).contains(&took), "2 MB at 4 Mbit/s took {took:.1} s");
+        let a = sender.join().unwrap();
+        assert!(!a.busy(), "nothing is left to send");
+        a.close();
+        b.close();
+    }
+
+    #[test]
+    fn pacing_does_not_hold_back_a_fast_path() {
+        // 40 MB over a wire with no delay: pacing by the window must not be
+        // what sets the speed (a few segments per sleep would take minutes).
+        let ((a, _a_in), (b, b_in)) = pair(0.0);
+        let block = vec![3u8; 1_000_000];
+        let t0 = Instant::now();
+        let sender = std::thread::spawn(move || {
+            for _ in 0..40 {
+                a.send(&block).unwrap();
+            }
+            a
+        });
+        for _ in 0..40 {
+            b_in.recv_timeout(Duration::from_secs(30)).expect("message arrives");
+        }
+        let took = t0.elapsed().as_secs_f64();
+        assert!(took < 12.0, "40 MB took {took:.1} s");
         sender.join().unwrap().close();
         b.close();
     }

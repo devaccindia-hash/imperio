@@ -8,7 +8,9 @@
 //!
 //! Files move by dragging rows from one side to the other, by the Send /
 //! Bring buttons, by copy and paste, or by dropping files from Explorer
-//! (those go to the folder shown on the other computer's side).
+//! (those go to the folder shown on the other computer's side). Rows of the
+//! other computer can also be dragged out of the window and let go over the
+//! Desktop or an open folder window: they are brought there.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::mpsc;
@@ -156,6 +158,9 @@ struct FilesApp {
     asked_at: Instant,
     notice: Option<(String, bool, Instant)>,
     first_frame: bool,
+    /// Rows being dragged (side, paths), remembered here because the toolkit
+    /// stops reporting a drag once the pointer has left the window.
+    dragging: Option<(bool, Vec<String>)>,
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -243,6 +248,7 @@ impl FilesApp {
             asked_at: Instant::now(),
             notice: None,
             first_frame: true,
+            dragging: None,
         };
         app.send(&UiCmd::Hello);
         // Tests point both sides at scratch folders instead of the Desktop.
@@ -340,6 +346,52 @@ impl FilesApp {
         } else {
             self.send(&UiCmd::Upload { xfer, paths, dest });
         }
+    }
+
+    /// Follow a drag of rows while the button is held, and act when it is
+    /// let go outside this window: over the Desktop or an open folder
+    /// window, rows of the other computer are brought there.
+    fn drag_out(&mut self, ctx: &egui::Context) {
+        if let Some(payload) = egui::DragAndDrop::payload::<DragPayload>(ctx) {
+            self.dragging = Some((payload.remote, payload.paths.clone()));
+        }
+        let Some((remote, _)) = &self.dragging else { return };
+        let remote = *remote;
+        let outside = pointer_outside_this_program();
+        if left_button_down() {
+            // Frames stop coming when the pointer is over another window;
+            // keep looking until the button is let go.
+            ctx.request_repaint_after(Duration::from_millis(30));
+            if outside.is_some() {
+                ctx.set_cursor_icon(if remote { egui::CursorIcon::Copy } else { egui::CursorIcon::NoDrop });
+            }
+            return;
+        }
+        let Some((_, paths)) = self.dragging.take() else { return };
+        let Some((x, y)) = outside else { return }; // let go inside: the panes deal with it
+        egui::DragAndDrop::clear_payload(ctx);
+        if !remote {
+            self.say("Those are already on this computer. Drag rows from the other computer\u{2019}s side out of the window to bring them here.", false);
+            return;
+        }
+        if self.welcome != Some(true) {
+            self.say("The other computer is not sharing its files.", true);
+            return;
+        }
+        let Some(folder) = imperio_files::shell::folder_at(x, y) else {
+            self.say("Let go over the Desktop or an open folder window, and the files are brought there.", true);
+            return;
+        };
+        let dest = folder.to_string_lossy().into_owned();
+        self.next_xfer += 1;
+        let xfer = self.next_xfer;
+        let label = match paths.as_slice() {
+            [one] => file_name(one),
+            many => format!("{} items", many.len()),
+        };
+        self.say(format!("Bringing {label} to {dest}"), false);
+        self.transfers.push(Transfer::new(xfer, label, false, dest.clone()));
+        self.send(&UiCmd::Download { xfer, paths, dest });
     }
 
     fn handle(&mut self, msg: In) {
@@ -794,6 +846,7 @@ impl eframe::App for FilesApp {
 
         let mut actions = Vec::new();
         self.shortcuts(&ctx, &mut actions);
+        self.drag_out(&ctx);
 
         egui::Panel::bottom("transfers")
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(20, 10)))
@@ -807,7 +860,7 @@ impl eframe::App for FilesApp {
                 }
                 ui.label(
                     RichText::new(
-                        "Drag files from one side to the other, or drop them here from Explorer. Right-click for rename, copy, move and delete.",
+                        "Drag files from one side to the other, or drop them here from Explorer. Drag a file of the other computer out of this window onto your Desktop or a folder to bring it there. Right-click for rename, copy, move and delete.",
                     )
                     .size(12.0)
                     .color(MUTED),
@@ -1104,6 +1157,36 @@ fn pane_ui(p: &mut Pane, ui: &mut egui::Ui, env: &Env, actions: &mut Vec<Action>
                 actions.push(Action::Transfer { from_remote: payload.remote, paths: payload.paths.clone() });
             }
         }
+    }
+}
+
+/// The main mouse button is held (the right one for a left-handed setup).
+fn left_button_down() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    // SAFETY: plain calls without arguments that could be invalid.
+    unsafe {
+        let key = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { 0x02 } else { 0x01 };
+        GetAsyncKeyState(key) < 0
+    }
+}
+
+/// Where the pointer is on the screen, when it is over a window that does
+/// not belong to this program (the Desktop, Explorer, anything else).
+fn pointer_outside_this_program() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowThreadProcessId, WindowFromPoint};
+    // SAFETY: valid out pointers; a null window is handled.
+    unsafe {
+        let mut at = POINT::default();
+        GetCursorPos(&mut at).ok()?;
+        let under = WindowFromPoint(at);
+        if under.0.is_null() {
+            return None;
+        }
+        let mut owner = 0u32;
+        GetWindowThreadProcessId(under, Some(&mut owner));
+        (owner != GetCurrentProcessId()).then_some((at.x, at.y))
     }
 }
 

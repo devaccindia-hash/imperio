@@ -99,8 +99,9 @@ h1, h2, h3 { margin: 0; text-wrap: balance; }
 .nav.stuck, .nav.open { background: rgba(14, 14, 16, .82); -webkit-backdrop-filter: saturate(140%) blur(16px); backdrop-filter: saturate(140%) blur(16px); border-bottom-color: var(--line); }
 .nav .wrap { display: flex; align-items: center; gap: 16px; height: 68px; }
 .brand { display: inline-flex; align-items: center; gap: 11px; font-weight: 650; font-size: 19px; letter-spacing: -.01em; min-height: 44px; }
-.logo { width: 28px; height: 28px; border-radius: 9px; background: linear-gradient(160deg, #f25a50, var(--red) 55%, var(--red-deep)); display: grid; place-items: center; box-shadow: 0 0 0 4px rgba(232, 69, 60, .16), 0 1px 0 rgba(255, 255, 255, .3) inset; flex: none; }
-.logo i { width: 9px; height: 9px; border-radius: 50%; background: #fff; display: block; }
+/* The drawing in icon.svg keeps a 4-in-64 margin; 114.3% makes its square fill this one. */
+.logo { width: 28px; height: 28px; border-radius: 7.5px; background: var(--red) url(icon.svg) center / 114.3% no-repeat; display: block; box-shadow: 0 0 0 4px rgba(232, 69, 60, .16); flex: none; }
+.logo i { display: none; }
 .links { display: flex; gap: 4px; margin-left: auto; font-size: 15px; color: var(--ink-2); }
 .links a { padding: 11px 13px; border-radius: 10px; transition: color .15s, background .15s; }
 .links a:hover { color: var(--ink); background: var(--card-2); }
