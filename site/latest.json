@@ -1,7 +1,7 @@
 {
-  "version": "0.3.18",
-  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.18/Imperio.exe",
-  "sha256": "fbbad62441183f4313bf8c170b06e46bc990ea21076fc3faccafdb54b44ab009",
-  "notes": "Weak connections no longer freeze the picture or make the ping climb, and key presses always arrive, so keys no longer get stuck.",
-  "sig": "64pIR2tqYe0pAUD8TdyU9MjuIYxRArdAWtVw8B93yjQ9JjDOHKVOSlupGv2GXnvJonhYqxYDi6LdXIro6O6CAQ"
+  "version": "0.3.19",
+  "url": "https://github.com/devaccindia-hash/imperio/releases/download/v0.3.19/Imperio.exe",
+  "sha256": "31a0a6a58b01b96c5beb157704137c4e0f18e6c7338421ff2eaba5638d962700",
+  "notes": "New logo. Smoother picture on slow connections. File copies no longer freeze the picture. The Windows key and Alt+Tab now work on the other computer. Drag files out of the Files window.",
+  "sig": "czYo5HXxKI9ooPv3bUa1A9gz-zO5sYf_0x-X1lxAY5ANEtZsjI73CdRdOmrmkyAFLk010s4o10NDjVQzwTZVCw"
 }
