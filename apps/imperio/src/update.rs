@@ -6,7 +6,7 @@
 //!
 //! ```json
 //! { "version": "0.4.0",
-//!   "url": "https://…/Imperio.exe",
+//!   "url": "https://â¦/Imperio.exe",
 //!   "sha256": "<hex of the exe>",
 //!   "notes": "What changed",
 //!   "sig": "<signature over version, url and sha256>" }
@@ -20,6 +20,7 @@
 //! installer, works for the portable single exe.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -120,18 +121,53 @@ fn staging_dir() -> PathBuf {
         .join("update")
 }
 
+/// How far the download under way has got: bytes received, and the size of
+/// the file when the server said it (0 when it did not).
+static RECEIVED: AtomicU64 = AtomicU64::new(0);
+static EXPECTED: AtomicU64 = AtomicU64::new(0);
+
+/// What to show while the update is being downloaded. Without figures a slow
+/// connection looks exactly like a download that has stopped: the file is
+/// about 12 MB and took five minutes on the owner's line on 2026-11-26.
+pub fn downloading_text() -> String {
+    let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let (got, all) = (RECEIVED.load(Ordering::Relaxed), EXPECTED.load(Ordering::Relaxed));
+    let progress = match (got, all) {
+        (0, _) => "starting".to_string(),
+        (got, 0) => format!("{:.1} MB so far", mb(got)),
+        (got, all) => format!("{:.1} of {:.1} MB ({}%)", mb(got), mb(all), (got * 100 / all).min(100)),
+    };
+    format!("Downloading the update\u{2026} {progress}. Imperio will restart by itself when it is ready.")
+}
+
 /// Download the release, verify its SHA-256, and return the staged path.
 pub fn download_and_stage(a: &Available) -> Result<PathBuf, String> {
-    let mut res = agent(600)
+    use std::io::Read;
+    RECEIVED.store(0, Ordering::Relaxed);
+    EXPECTED.store(0, Ordering::Relaxed);
+    // Half an hour: a slow line must be allowed to finish.
+    let mut res = agent(1800)
         .get(&a.url)
         .call()
         .map_err(|e| format!("download failed ({e})"))?;
-    let bytes = res
-        .body_mut()
-        .with_config()
-        .limit(512 * 1024 * 1024)
-        .read_to_vec()
-        .map_err(|e| format!("download failed ({e})"))?;
+    let expected = res
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    EXPECTED.store(expected, Ordering::Relaxed);
+    let mut reader = res.body_mut().with_config().limit(512 * 1024 * 1024).reader();
+    let mut bytes = Vec::with_capacity(expected.min(64 * 1024 * 1024) as usize);
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).map_err(|e| format!("download failed ({e})"))?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        RECEIVED.store(bytes.len() as u64, Ordering::Relaxed);
+    }
     let digest = Sha256::digest(&bytes);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     if hex != a.sha256 {
@@ -230,6 +266,48 @@ pub fn sign_manifest_file(path: &Path, seed_b64: &str, exe: Option<&Path>) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Downloads the published release for real and checks it against the
+    /// published checksum (needs the internet, so it only runs when asked:
+    /// `cargo test -p imperio -- --ignored --nocapture`). Set LOCALAPPDATA to
+    /// a scratch folder first; the file is staged under it.
+    #[test]
+    #[ignore]
+    fn the_published_release_downloads_and_matches() {
+        let text = include_str!("../../../site/latest.json");
+        let m: Manifest = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap();
+        let a = Available { version: m.version, url: m.url, sha256: m.sha256.to_lowercase(), notes: m.notes };
+        let watcher = std::thread::spawn(|| {
+            let mut seen = Vec::new();
+            for _ in 0..3000 {
+                std::thread::sleep(Duration::from_millis(200));
+                let text = downloading_text();
+                if seen.last() != Some(&text) {
+                    println!("{text}");
+                    seen.push(text);
+                }
+                let (got, all) = (RECEIVED.load(Ordering::Relaxed), EXPECTED.load(Ordering::Relaxed));
+                if all > 0 && got >= all {
+                    break;
+                }
+            }
+            seen.len()
+        });
+        let staged = download_and_stage(&a).expect("download and checksum");
+        assert!(staged.is_file());
+        assert!(watcher.join().unwrap() >= 2, "progress was reported along the way");
+    }
+
+    #[test]
+    fn progress_text_reads_well() {
+        RECEIVED.store(0, Ordering::Relaxed);
+        EXPECTED.store(0, Ordering::Relaxed);
+        assert!(downloading_text().contains("starting"));
+        RECEIVED.store(3 * 1024 * 1024, Ordering::Relaxed);
+        assert!(downloading_text().contains("3.0 MB so far"));
+        EXPECTED.store(12 * 1024 * 1024, Ordering::Relaxed);
+        assert!(downloading_text().contains("3.0 of 12.0 MB (25%)"), "{}", downloading_text());
+    }
 
     #[test]
     fn version_ordering() {

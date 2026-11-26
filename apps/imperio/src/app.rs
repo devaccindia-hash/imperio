@@ -850,11 +850,9 @@ impl ImperioApp {
             }
             UpdateState::Downloading => {
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Downloading the update\u{2026} Imperio will restart by itself when it is ready.")
-                        .size(12.5)
-                        .color(AMBER),
-                );
+                ui.label(RichText::new(crate::update::downloading_text()).size(12.5).color(AMBER));
+                // Keep the figures moving.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
             _ => {}
         }
@@ -1293,7 +1291,7 @@ impl ImperioApp {
             UpdateState::Available(a) | UpdateState::Dismissed(a) => {
                 format!("Version {cur} \u{2014} {} is available", a.version)
             }
-            UpdateState::Downloading => "Downloading the update\u{2026} Imperio will restart by itself.".to_string(),
+            UpdateState::Downloading => crate::update::downloading_text(),
             UpdateState::Failed(e) => format!("Version {cur} \u{2014} {e}"),
         };
         ui.horizontal_wrapped(|ui| {
